@@ -84,6 +84,9 @@ opt-level = 3
 [profile.dev.package.display-interface-spi]
 opt-level = 3
 
+[profile.dev.package.esp-osm]
+opt-level = 3
+
 [profile.dev]
 opt-level = "z"
 lto = false
