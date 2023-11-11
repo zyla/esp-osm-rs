@@ -35,11 +35,11 @@ pub use esp32c6_hal as hal;
 
 #[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
 use hal::systimer::SystemTimer;
-use hal::Rng;
 use hal::{
     clock::ClockControl, embassy, gpio::*, peripherals::Peripherals, prelude::*, timer::TimerGroup,
     Rtc, IO,
 };
+use hal::{Delay, Rng};
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_io_async::Read;
@@ -230,7 +230,7 @@ async fn main(spawner: embassy_executor::Spawner) {
             mosi,
             miso,
             cs,
-            80_u32.MHz(),
+            60_u32.MHz(),
             SpiMode::Mode0,
             &mut system.peripheral_clock_control,
             &clocks,
@@ -251,10 +251,12 @@ async fn main(spawner: embassy_executor::Spawner) {
     display.clear(display::BACKGROUND).unwrap();
     display::flush(&mut display).unwrap();
 
+    let delay = Delay::new(&clocks);
+
     //   spawner.spawn(connection_wifi(controller)).ok();
     //   spawner.spawn(net_task(stack)).ok();
     spawner
-        .spawn(task(input, stack, seed.into(), display, rtc))
+        .spawn(task(input, stack, seed.into(), display, delay, rtc))
         .ok();
 }
 
@@ -263,7 +265,8 @@ async fn task(
     mut input: BUTTON,
     stack: &'static Stack<WifiDevice<'static>>,
     _seed: u64,
-    mut display: DISPLAY<'static>,
+    display: DISPLAY<'static>,
+    mut delay: Delay,
     rtc: Rtc<'static>,
 ) {
     let png_bytes = include_bytes!("../test-tile.png");
@@ -301,6 +304,22 @@ async fn task(
         let start = rtc.get_time_us();
 
         // 1 = data, 0 = command
+
+        // Get Scanline
+        dc.set_low().unwrap();
+        spi.write(&[0x45]).unwrap();
+        delay.delay_us(10u32);
+        dc.set_high().unwrap();
+        delay.delay_us(10u32);
+        let b1 = spi.read().unwrap();
+        let b2 = spi.read().unwrap();
+        let b3 = spi.read().unwrap();
+
+        println!("scanline = {} {} {}", b1, b2, b3);
+
+        dc.set_low().unwrap();
+        spi.write(&[0x45]).unwrap();
+        dc.set_high().unwrap();
 
         // Set Column Address
         dc.set_low().unwrap();
