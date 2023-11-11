@@ -40,6 +40,7 @@ use hal::dma::Channel;
 use hal::pdma::Spi2DmaChannel;
 #[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
 use hal::systimer::SystemTimer;
+use hal::FlashSafeDma;
 use hal::{
     clock::ClockControl, embassy, gpio::*, peripherals::Peripherals, prelude::*, timer::TimerGroup,
     Rtc, IO,
@@ -300,8 +301,7 @@ async fn task(
     let end = rtc.get_time_us();
     println!("minipng decoded in {}us", end - start);
 
-    let Aligned(pixel_buffer_2) =
-        Aligned(make_static!(heapless::Vec::<u8, { 256 * 100 * 2 }>::new()));
+    let pixel_buffer_2 = make_static!(heapless::Vec::<u8, { 256 * 100 * 2 }>::new());
 
     image_data
         .pixels()
@@ -322,14 +322,12 @@ async fn task(
     let descriptors = make_static!([0u32; 8 * 3]);
     let rx_descriptors = make_static!([0u32; 8 * 3]);
 
-    let mut spi = spi.with_dma(dma_channel.configure(
+    let mut spi = FlashSafeDma::<_, 8>::new(spi.with_dma(dma_channel.configure(
         false,
         descriptors,
         rx_descriptors,
         DmaPriority::Priority0,
-    ));
-
-    let Aligned(mut cmd_buf) = make_static!(Aligned([0u8; 4]));
+    )));
 
     loop {
         Timer::after(Duration::from_millis(0)).await;
@@ -340,29 +338,21 @@ async fn task(
         use crate::hal::prelude::_embedded_hal_async_spi_SpiBus as SpiBus;
         use crate::hal::prelude::_embedded_hal_blocking_spi_Write as Write;
 
-        let mut write_cmd = {
-            let spi = &mut spi;
-            move |cmd: &[u8]| {
-                cmd_buf[..cmd.len()].copy_from_slice(cmd);
-                Write::write(spi, &cmd_buf[..cmd.len()])
-            }
-        };
-
         // Set Column Address
         dc.set_low().unwrap();
-        write_cmd(&[0x2A]).unwrap();
+        Write::write(&mut spi, &[0x2A]).unwrap();
         dc.set_high().unwrap();
-        write_cmd(&[0, 0, 0, 255]).unwrap();
+        Write::write(&mut spi, &[0, 0, 0, 255]).unwrap();
 
         // Set Page Address
         dc.set_low().unwrap();
-        write_cmd(&[0x2B]).unwrap();
+        Write::write(&mut spi, &[0x2B]).unwrap();
         dc.set_high().unwrap();
-        write_cmd(&[0, 0, 0, 239]).unwrap();
+        Write::write(&mut spi, &[0, 0, 0, 239]).unwrap();
 
         // Write Memory Start
         dc.set_low().unwrap();
-        write_cmd(&[0x2C]).unwrap();
+        Write::write(&mut spi, &[0x2C]).unwrap();
         dc.set_high().unwrap();
 
         // Simulate drawing "mini-tiles" 64x64
@@ -374,9 +364,6 @@ async fn task(
         println!("rendered in {}us", end - start);
     }
 }
-
-#[repr(align(4))]
-struct Aligned<T>(T);
 
 // TODO: something like this should be in `incremental-png` itself
 struct PngReader {
