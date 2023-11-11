@@ -212,6 +212,12 @@ async fn main(spawner: embassy_executor::Spawner) {
     )
     .unwrap();
 
+    hal::interrupt::enable(
+        hal::peripherals::Interrupt::SPI2_DMA,
+        hal::interrupt::Priority::Priority1,
+    )
+    .unwrap();
+
     use display::*;
     let mut display: DISPLAY = {
         use display_interface_spi::SPIInterfaceNoCS;
@@ -331,6 +337,7 @@ async fn task(
         let start = rtc.get_time_us();
 
         // 1 = data, 0 = command
+        use crate::hal::prelude::_embedded_hal_async_spi_SpiBus as SpiBus;
         use crate::hal::prelude::_embedded_hal_blocking_spi_Write as Write;
 
         let mut write_cmd = {
@@ -357,7 +364,11 @@ async fn task(
         dc.set_low().unwrap();
         write_cmd(&[0x2C]).unwrap();
         dc.set_high().unwrap();
-        Write::write(&mut spi, pixel_buffer_2).unwrap();
+
+        // Simulate drawing "mini-tiles" 64x64
+        for chunk in pixel_buffer_2.chunks(64 * 64 * 2) {
+            SpiBus::write(&mut spi, chunk).await.unwrap();
+        }
 
         let end = rtc.get_time_us();
         println!("rendered in {}us", end - start);
