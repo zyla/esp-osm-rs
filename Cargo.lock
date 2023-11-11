@@ -598,8 +598,6 @@ dependencies = [
 [[package]]
 name = "esp-hal-common"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29b785e4195e1e1e6fae5b8c7fc44a1a71efa94e0b69527a38cce64815bfe7a6"
 dependencies = [
  "basic-toml",
  "bitfield",
@@ -643,8 +641,6 @@ dependencies = [
 [[package]]
 name = "esp-hal-procmacros"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4cdf19581f9b0bb2b57b1549a2e639342825344b52f34048ddb29c46efa30de"
 dependencies = [
  "darling",
  "proc-macro-crate",
@@ -701,8 +697,6 @@ dependencies = [
 [[package]]
 name = "esp-riscv-rt"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7639ac03e9fe4e6d5f1c0e90b95ce9478d487335f6684c22b3515e6dc3155d8f"
 dependencies = [
  "riscv",
  "riscv-rt-macros",
@@ -774,8 +768,6 @@ dependencies = [
 [[package]]
 name = "esp32-hal"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0072436ea4efbe976b38568fd93ba6a1e0ee9f64b5cc2b6053fa68ad8cf89e0"
 dependencies = [
  "embassy-time 0.1.5",
  "esp-hal-common",

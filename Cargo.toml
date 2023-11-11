@@ -12,6 +12,9 @@ embassy-net-driver = { git = "https://github.com/zyla/embassy", rev = "4e27208fc
 embassy-time = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
 embassy-macros = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
 
+esp-hal-common = { path = "./libs/esp-hal/esp-hal-common" }
+esp32-hal = { path = "./libs/esp-hal/esp32-hal" }
+
 [dependencies]
 esp-backtrace = { version = "0.8.0", features = ["panic-handler", "exception-handler", "print-uart"] }
 esp-println = { version = "0.6.0", features = ["log"] }
@@ -82,6 +85,12 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.display-interface-spi]
+opt-level = 3
+
+[profile.dev.package.esp-hal-common]
+opt-level = 3
+
+[profile.dev.package.esp32-hal]
 opt-level = 3
 
 [profile.dev.package.esp-osm]

@@ -1,3 +1,6 @@
 [submodule "libs/xpt2046"]
 	path = libs/xpt2046
 	url = https://github.com/zyla/xpt2046.git
+[submodule "libs/esp-hal"]
+	path = libs/esp-hal
+	url = https://github.com/zyla/esp-hal
