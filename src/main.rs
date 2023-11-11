@@ -6,6 +6,9 @@
 #![allow(clippy::upper_case_acronyms)]
 
 extern crate alloc;
+use crate::hal::dma::DmaPriority;
+use crate::hal::pdma::Dma;
+use crate::hal::pdma::Spi2DmaChannelCreator;
 use core::future::Future;
 use core::{alloc::GlobalAlloc, ops::ControlFlow, str};
 use embassy_net::{
@@ -33,6 +36,8 @@ pub use esp32c3_hal as hal;
 #[cfg(feature = "esp32c6")]
 pub use esp32c6_hal as hal;
 
+use hal::dma::Channel;
+use hal::pdma::Spi2DmaChannel;
 #[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
 use hal::systimer::SystemTimer;
 use hal::{
@@ -230,7 +235,7 @@ async fn main(spawner: embassy_executor::Spawner) {
             mosi,
             miso,
             cs,
-            60_u32.MHz(),
+            40_u32.MHz(),
             SpiMode::Mode0,
             &mut system.peripheral_clock_control,
             &clocks,
@@ -248,6 +253,8 @@ async fn main(spawner: embassy_executor::Spawner) {
         display
     };
 
+    let dma = Dma::new(system.dma, &mut system.peripheral_clock_control);
+
     display.clear(display::BACKGROUND).unwrap();
     display::flush(&mut display).unwrap();
 
@@ -256,7 +263,15 @@ async fn main(spawner: embassy_executor::Spawner) {
     //   spawner.spawn(connection_wifi(controller)).ok();
     //   spawner.spawn(net_task(stack)).ok();
     spawner
-        .spawn(task(input, stack, seed.into(), display, delay, rtc))
+        .spawn(task(
+            input,
+            stack,
+            seed.into(),
+            display,
+            delay,
+            rtc,
+            dma.spi2channel,
+        ))
         .ok();
 }
 
@@ -268,6 +283,7 @@ async fn task(
     display: DISPLAY<'static>,
     mut delay: Delay,
     rtc: Rtc<'static>,
+    dma_channel: Spi2DmaChannelCreator,
 ) {
     let png_bytes = include_bytes!("../test-tile.png");
 
@@ -278,7 +294,8 @@ async fn task(
     let end = rtc.get_time_us();
     println!("minipng decoded in {}us", end - start);
 
-    let pixel_buffer_2 = make_static!(heapless::Vec::<u8, { 256 * 140 * 2 }>::new());
+    let Aligned(pixel_buffer_2) =
+        Aligned(make_static!(heapless::Vec::<u8, { 256 * 100 * 2 }>::new()));
 
     image_data
         .pixels()
@@ -293,8 +310,20 @@ async fn task(
         .take(pixel_buffer_2.capacity())
         .collect_into(pixel_buffer_2);
 
-    let (di, m, _) = display.release();
-    let (mut spi, mut dc) = di.release();
+    let (di, _, _) = display.release();
+    let (spi, mut dc) = di.release();
+
+    let descriptors = make_static!([0u32; 8 * 3]);
+    let rx_descriptors = make_static!([0u32; 8 * 3]);
+
+    let mut spi = spi.with_dma(dma_channel.configure(
+        false,
+        descriptors,
+        rx_descriptors,
+        DmaPriority::Priority0,
+    ));
+
+    let Aligned(mut cmd_buf) = make_static!(Aligned([0u8; 8]));
 
     loop {
         Timer::after(Duration::from_millis(0)).await;
@@ -302,45 +331,41 @@ async fn task(
         let start = rtc.get_time_us();
 
         // 1 = data, 0 = command
+        use crate::hal::prelude::_embedded_hal_blocking_spi_Write as Write;
 
-        // Get Scanline
-        dc.set_low().unwrap();
-        spi.write(&[0x45]).unwrap();
-        delay.delay_us(10u32);
-        dc.set_high().unwrap();
-        delay.delay_us(10u32);
-        let b1 = spi.read().unwrap();
-        let b2 = spi.read().unwrap();
-        let b3 = spi.read().unwrap();
-
-        println!("scanline = {} {} {}", b1, b2, b3);
-
-        dc.set_low().unwrap();
-        spi.write(&[0x45]).unwrap();
-        dc.set_high().unwrap();
+        let mut write_cmd = {
+            let spi = &mut spi;
+            move |cmd: &[u8]| {
+                cmd_buf[..cmd.len()].copy_from_slice(cmd);
+                Write::write(spi, &cmd_buf[..cmd.len()])
+            }
+        };
 
         // Set Column Address
         dc.set_low().unwrap();
-        spi.write(&[0x2A]).unwrap();
+        write_cmd(&[0x2A]).unwrap();
         dc.set_high().unwrap();
-        spi.write(&[0, 0, 0, 255]).unwrap();
+        write_cmd(&[0, 0, 0, 255]).unwrap();
 
         // Set Page Address
         dc.set_low().unwrap();
-        spi.write(&[0x2B]).unwrap();
+        write_cmd(&[0x2B]).unwrap();
         dc.set_high().unwrap();
-        spi.write(&[0, 0, 0, 239]).unwrap();
+        write_cmd(&[0, 0, 0, 239]).unwrap();
 
         // Write Memory Start
         dc.set_low().unwrap();
-        spi.write(&[0x2C]).unwrap();
+        write_cmd(&[0x2C]).unwrap();
         dc.set_high().unwrap();
-        spi.write(pixel_buffer_2).unwrap();
+        Write::write(&mut spi, pixel_buffer_2).unwrap();
 
         let end = rtc.get_time_us();
         println!("rendered in {}us", end - start);
     }
 }
+
+#[repr(align(8))]
+struct Aligned<T>(T);
 
 // TODO: something like this should be in `incremental-png` itself
 struct PngReader {
