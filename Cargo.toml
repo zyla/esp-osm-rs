@@ -41,24 +41,16 @@ esp32c3-hal = { version = "0.12.0", features=["embassy","async","embassy-time-ti
 esp32c6-hal = { version = "0.5.0", features=["embassy","async","embassy-time-timg0"], optional = true }
 esp32-hal = { version = "0.15.0", features=["embassy","async","embassy-time-timg0"], optional = true }
 
-# display drivers
-st7735-lcd = {version = "0.9.0", optional = true }
-ssd1306 = { version = "0.8.4", optional = true }
-display-interface = { version = "0.4.1", optional = true}
-
+display-interface = { version = "0.4.1" }
+display-interface-spi = "0.4.1"
 
 incremental-png = { git = "https://github.com/zyla/incremental-png", rev = "e05eaf91f8fd8d10f0dca7ba461c6190520c4f94" }
 embedded-io-async = "0.6.0"
-mipidsi = { version = "0.7.1", optional = true }
-display-interface-spi = "0.4.1"
+mipidsi = { version = "0.7.1" }
 xpt2046 = { version = "0.3.1", path = "libs/xpt2046" }
 
 [features]
-default = ["display-ili9341", "esp32"]
-display-ssd1306 = ["ssd1306", "display-interface"]
-display-ili9488 = ["mipidsi", "display-interface"]
-display-ili9341 = ["mipidsi", "display-interface"]
-display-st7789 = ["mipidsi", "display-interface"]
+default = ["esp32"]
 
 esp32c3 = ["esp32c3-hal", "esp-backtrace/esp32c3", "esp-println/esp32c3", "esp-wifi/esp32c3", "embassy-executor/arch-riscv32"]
 esp32c6 = ["esp32c6-hal", "esp-backtrace/esp32c6", "esp-println/esp32c6", "esp-wifi/esp32c6", "embassy-executor/arch-riscv32"]
