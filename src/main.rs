@@ -299,8 +299,6 @@ async fn task(
     loop {
         Timer::after(Duration::from_millis(0)).await;
 
-        println!("render start");
-
         let start = rtc.get_time_us();
 
         // 1 = data, 0 = command
