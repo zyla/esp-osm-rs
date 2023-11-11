@@ -655,6 +655,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-osm"
+version = "0.1.0"
+dependencies = [
+ "display-interface",
+ "display-interface-spi",
+ "embassy-executor",
+ "embassy-macros",
+ "embassy-net",
+ "embassy-net-driver",
+ "embassy-time 0.1.5",
+ "embedded-graphics 0.8.1",
+ "embedded-io 0.4.0",
+ "embedded-io-async 0.6.0",
+ "embedded-svc",
+ "embedded-text",
+ "esp-alloc",
+ "esp-backtrace",
+ "esp-println",
+ "esp-wifi",
+ "esp32-hal",
+ "esp32c3-hal",
+ "esp32c6-hal",
+ "heapless",
+ "incremental-png",
+ "log",
+ "minipng",
+ "mipidsi",
+ "reqwless",
+ "smoltcp",
+ "static_cell",
+ "xpt2046",
+]
+
+[[package]]
 name = "esp-println"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -724,39 +758,6 @@ version = "0.1.0"
 source = "git+https://github.com/jborkowski/esp-wifi/?rev=5ad2714#5ad27144b1c1359892c6bf59c79257c230a1a8ab"
 dependencies = [
  "anyhow",
-]
-
-[[package]]
-name = "esp-xkcd"
-version = "0.1.0"
-dependencies = [
- "display-interface",
- "display-interface-spi",
- "embassy-executor",
- "embassy-macros",
- "embassy-net",
- "embassy-net-driver",
- "embassy-time 0.1.5",
- "embedded-graphics 0.8.1",
- "embedded-io 0.4.0",
- "embedded-io-async 0.6.0",
- "embedded-svc",
- "embedded-text",
- "esp-alloc",
- "esp-backtrace",
- "esp-println",
- "esp-wifi",
- "esp32-hal",
- "esp32c3-hal",
- "esp32c6-hal",
- "heapless",
- "incremental-png",
- "log",
- "mipidsi",
- "reqwless",
- "smoltcp",
- "static_cell",
- "xpt2046",
 ]
 
 [[package]]
@@ -1152,6 +1153,12 @@ checksum = "1f98b09920c8be9ff96a5625aca5b5db7a4f4ba025132ff7d7aacb72c0244a45"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "minipng"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44aaf824f3dbcc8a4ab8fd66964fed5200a632d5794775a2426e77e3833776a8"
 
 [[package]]
 name = "miniz_oxide"

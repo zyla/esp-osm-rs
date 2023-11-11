@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
+#![feature(async_closure)]
 #![allow(clippy::upper_case_acronyms)]
 
 extern crate alloc;
+use core::future::Future;
 use core::{alloc::GlobalAlloc, ops::ControlFlow, str};
 use embassy_net::{
     dns::DnsSocket,
@@ -11,7 +13,11 @@ use embassy_net::{
     Config, Stack, StackResources,
 };
 use embassy_time::{Duration, Timer};
-use embedded_graphics::{pixelcolor::Gray8, prelude::Dimensions};
+use embedded_graphics::pixelcolor::{Rgb565, Rgb666};
+use embedded_graphics::{
+    pixelcolor::{Gray8, Rgb888},
+    prelude::Dimensions,
+};
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp_backtrace as _;
 use esp_println::println;
@@ -38,7 +44,7 @@ use embedded_io_async::Read;
 use incremental_png::{
     dechunker::Dechunker,
     inflater::{self, Inflater},
-    stream_decoder::{ImageHeader, StreamDecoder},
+    stream_decoder::{Event, ImageHeader, StreamDecoder},
 };
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
@@ -221,7 +227,7 @@ async fn main(spawner: embassy_executor::Spawner) {
             mosi,
             miso,
             cs,
-            60_u32.MHz(),
+            80_u32.MHz(),
             SpiMode::Mode0,
             &mut system.peripheral_clock_control,
             &clocks,
@@ -242,8 +248,8 @@ async fn main(spawner: embassy_executor::Spawner) {
     display.clear(display::BACKGROUND).unwrap();
     display::flush(&mut display).unwrap();
 
-    spawner.spawn(connection_wifi(controller)).ok();
-    spawner.spawn(net_task(stack)).ok();
+    //   spawner.spawn(connection_wifi(controller)).ok();
+    //   spawner.spawn(net_task(stack)).ok();
     spawner
         .spawn(task(input, stack, seed.into(), display, rtc))
         .ok();
@@ -257,179 +263,39 @@ async fn task(
     mut display: DISPLAY<'static>,
     rtc: Rtc<'static>,
 ) {
-    let mut rx_buffer = [0; 2048];
-    let client_state = TcpClientState::<1, 2048, 2048>::new();
-    let tcp_client = TcpClient::new(stack, &client_state);
-    let dns = DnsSocket::new(stack);
+    let png_bytes = include_bytes!("../test-tile.png");
 
-    const IMAGE_URLS: &[&str] = &[
-        "http://imgs.xkcd.com/comics/book_burning.png",
-        "http://imgs.xkcd.com/comics/the_universal_label.png",
-        "http://imgs.xkcd.com/comics/journal_4.png",
-        "http://imgs.xkcd.com/comics/daylight_saving_choice.png",
-        // biggest grayscale image - 549K
-        "http://imgs.xkcd.com/comics/the_pace_of_modern_life.png",
-        // non-text
-        "http://imgs.xkcd.com/comics/to_be_wanted.png",
-        // Doesn't work, we only handle grayscale images for now
-        "http://imgs.xkcd.com/comics/dendrochronology.png",
-        // Crashes with "buffer error" from incremental-png :(
-        // "http://imgs.xkcd.com/comics/depth.png",
-
-        // We don't handle this color type
-        // "http://imgs.xkcd.com/comics/breaker_box.png",
-    ];
-
-    let display_width = display.bounding_box().size.width;
-    let display_height = display.bounding_box().size.height;
-    let mut image_index = 0;
-    let mut image_offset_x: u32 = 0;
-    let mut image_offset_y: u32 = 0;
+    println!("num png bytes: {}", png_bytes.len());
+    let start = rtc.get_time_us();
+    let pixel_buffer = make_static!([0u8; 256 * 256 + 256]);
+    let image_data = minipng::decode_png(png_bytes, pixel_buffer).unwrap();
+    let end = rtc.get_time_us();
+    println!("minipng decoded in {}us", end - start);
 
     loop {
-        stack.wait_config_up().await;
-        loop {
-            if let Some(config) = stack.config_v4() {
-                println!("Got IP: {}", config.address);
-                break;
-            }
-            Timer::after(Duration::from_millis(500)).await;
-        }
+        Timer::after(Duration::from_millis(0)).await;
 
-        display.clear(display::TEXT).unwrap();
-        display::flush(&mut display).unwrap();
+        println!("render start");
 
-        // FIXME: HTTPS doesn't work on imgs.xkcd.com: Tls(HandshakeAborted(Fatal, ProtocolVersion))
-        // let mut tls_read_buffer = [0; 8 * 1024];
-        // let mut tls_write_buffer = [0; 8 * 1024];
-        // let tls_config = TlsConfig::new(
-        //     seed,
-        //     &mut tls_read_buffer,
-        //     &mut tls_write_buffer,
-        //     TlsVerify::None,
-        // );
-        // let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns, tls_config);
-
-        let mut http_client = HttpClient::new(&tcp_client, &dns);
-        let mut request = http_client
-            .request(Method::GET, IMAGE_URLS[image_index])
-            .await
+        let start = rtc.get_time_us();
+        display
+            .set_pixels(
+                0,
+                0,
+                255,
+                239,
+                image_data
+                    .pixels()
+                    .iter()
+                    .map(|&index| {
+                        let rgb = image_data.palette(index);
+                        Rgb666::new(rgb[1], rgb[2], rgb[0]).into()
+                    })
+                    .take(256 * 240),
+            )
             .unwrap();
-
-        let response = request.send(&mut rx_buffer).await.unwrap();
-
-        println!("Content-length: {:?}", response.content_length);
-
-        let mut png = PngReader::new();
-        let mut reader = response.body().reader();
-
-        let mut image_x: u32 = 0;
-        let mut image_y: u32 = 0;
-        let mut image_header: Option<ImageHeader> = None;
-
-        let mut buf = [0; 2048];
-        let mut total_bytes_read = 0;
-        loop {
-            let n = reader.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            total_bytes_read += n;
-            println!("Received {} bytes (total {})", n, total_bytes_read);
-            let start = rtc.get_time_us();
-            let mut num_drawn = 0;
-            let flow = png.process_data::<()>(&buf[..n], |event| {
-                match event {
-                    inflater::Event::ImageHeader(header) => {
-                        println!("Image header: {:?}", header);
-                        image_header = Some(header);
-
-                        display.clear(display::BACKGROUND).unwrap();
-                        display::flush(&mut display).unwrap();
-                    }
-                    inflater::Event::End => {
-                        println!("Image end");
-                    }
-                    inflater::Event::ImageData(pixels) => {
-                        let image_header = image_header.as_ref().expect("no header!");
-
-                        // Assuming 8-bit grayscale, no filtering, no interlacing
-
-                        for pixel in pixels.iter().copied() {
-                            let display_x = image_x as i32 - image_offset_x as i32;
-                            let display_y = image_y as i32 - image_offset_y as i32;
-
-                            if display_y >= 0 && display_x >= 0 && display_x < display_width as i32
-                            {
-                                display::set_pixel(
-                                    &mut display,
-                                    display_x as u32,
-                                    display_y as u32,
-                                    Gray8::new(pixel).into(),
-                                )
-                                .unwrap();
-                                num_drawn += 1;
-                            }
-                            image_x += 1;
-
-                            // FIXME: Logically we shouldn't need the +1 here. But without it the
-                            // image renders with a off-by-one error. What's going on?
-                            if image_x == image_header.width + 1 {
-                                image_x = 0;
-                                image_y += 1;
-                            }
-
-                            let display_y = image_y as i32 - image_offset_y as i32;
-                            if display_y == display_height as i32 {
-                                println!("End of display");
-                                return ControlFlow::Break(());
-                            }
-                        }
-                    }
-                }
-                ControlFlow::Continue(())
-            });
-            let duration = rtc.get_time_us() - start;
-            println!("Processed in {}us (drawn {} pixels)", duration, num_drawn);
-            display::flush(&mut display).unwrap();
-            if let ControlFlow::Break(_) = flow {
-                break;
-            }
-        }
-
-        // Disconnect
-        drop(request);
-        drop(http_client);
-
-        // Decide what to do next: scroll horizontally, scroll vertically, or next image
-        let image_header = image_header.as_ref().expect("no header!");
-        if image_offset_x + display_width < image_header.width {
-            // scroll right
-            image_offset_x = core::cmp::min(
-                image_header.width - display_width,
-                image_offset_x + display_width * 3 / 2,
-            );
-        } else if image_offset_y + display_height < image_header.height {
-            // back to left edge, scroll vertically
-            image_offset_x = 0;
-            image_offset_y = core::cmp::min(
-                image_header.height - display_height,
-                image_offset_y + display_height,
-            );
-        } else {
-            // next image
-            image_offset_x = 0;
-            image_offset_y = 0;
-            image_index = (image_index + 1) % IMAGE_URLS.len();
-        }
-
-        // wait for button press
-        loop {
-            let _ = input.wait_for_any_edge().await;
-            if input.is_high().unwrap() {
-                break;
-            }
-        }
+        let end = rtc.get_time_us();
+        println!("rendered in {}us", end - start);
     }
 }
 
@@ -437,7 +303,7 @@ async fn task(
 struct PngReader {
     dechunker: Dechunker,
     sd: StreamDecoder,
-    inflater: Inflater<2048>,
+    inflater: Inflater<16384>,
 }
 
 impl PngReader {
@@ -449,22 +315,34 @@ impl PngReader {
         }
     }
 
-    fn process_data<B>(
+    async fn process_data<B, R>(
         &mut self,
         mut input: &[u8],
-        mut block: impl FnMut(inflater::Event) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
+        mut block: impl FnMut(inflater::Event) -> R,
+    ) -> ControlFlow<B>
+    where
+        R: Future<Output = ControlFlow<B>>,
+    {
         while !input.is_empty() {
-            let (consumed, mut dc_event) = self.dechunker.update(&input).unwrap();
+            let (consumed, mut dc_event) = self
+                .dechunker
+                .update(&input[..core::cmp::min(1024000, input.len())])
+                .unwrap();
 
             while let Some(e) = dc_event {
                 let (leftover, mut sd_event) = self.sd.update(e).unwrap();
+                match sd_event {
+                    None => println!("None"),
+                    Some(Event::ImageHeader(_)) => println!("ImageHeader"),
+                    Some(Event::ImageData(buf)) => println!("ImageData({})", buf.len()),
+                    Some(Event::End) => println!("End"),
+                }
 
                 while let Some(e) = sd_event {
                     let (leftover, i_event) = self.inflater.update(e).unwrap();
 
                     if let Some(e) = i_event {
-                        block(e)?;
+                        block(e).await?;
                     }
 
                     sd_event = leftover;

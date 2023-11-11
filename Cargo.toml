@@ -1,5 +1,5 @@
 [package]
-name = "esp-xkcd"
+name = "esp-osm"
 version = "0.1.0"
 authors = ["Jonatan Borkowski <jonatan@thebo.me>", "Maciej Bielecki <zyla@prati.pl>"]
 edition = "2021"
@@ -48,6 +48,7 @@ incremental-png = { git = "https://github.com/zyla/incremental-png", rev = "e05e
 embedded-io-async = "0.6.0"
 mipidsi = { version = "0.7.1" }
 xpt2046 = { version = "0.3.1", path = "libs/xpt2046" }
+minipng = "0.1.1"
 
 [features]
 default = ["esp32"]
@@ -62,7 +63,25 @@ opt-level = 3
 [profile.dev.package.incremental-png]
 opt-level = 3
 
+[profile.dev.package.minipng]
+opt-level = 3
+
 [profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.embedded-graphics]
+opt-level = 3
+
+[profile.dev.package.embedded-graphics-core]
+opt-level = 3
+
+[profile.dev.package.mipidsi]
+opt-level = 3
+
+[profile.dev.package.display-interface]
+opt-level = 3
+
+[profile.dev.package.display-interface-spi]
 opt-level = 3
 
 [profile.dev]
