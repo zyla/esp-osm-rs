@@ -6,6 +6,8 @@
 #![allow(clippy::upper_case_acronyms)]
 
 extern crate alloc;
+use crate::hal::dma::DmaPriority;
+use crate::hal::pdma::Dma;
 use core::future::Future;
 use core::{alloc::GlobalAlloc, ops::ControlFlow, str};
 use embassy_net::{
@@ -33,6 +35,7 @@ pub use esp32c3_hal as hal;
 #[cfg(feature = "esp32c6")]
 pub use esp32c6_hal as hal;
 
+use hal::pdma::Spi2DmaChannelCreator;
 #[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
 use hal::systimer::SystemTimer;
 use hal::Rng;
@@ -207,6 +210,12 @@ async fn main(spawner: embassy_executor::Spawner) {
     )
     .unwrap();
 
+    esp32_hal::interrupt::enable(
+        esp32_hal::peripherals::Interrupt::SPI2_DMA,
+        esp32_hal::interrupt::Priority::Priority1,
+    )
+    .unwrap();
+
     use display::*;
     let mut display: DISPLAY = {
         use display_interface_spi::SPIInterfaceNoCS;
@@ -230,7 +239,7 @@ async fn main(spawner: embassy_executor::Spawner) {
             mosi,
             miso,
             cs,
-            80_u32.MHz(),
+            40_u32.MHz(),
             SpiMode::Mode0,
             &mut system.peripheral_clock_control,
             &clocks,
@@ -248,13 +257,22 @@ async fn main(spawner: embassy_executor::Spawner) {
         display
     };
 
+    let dma = Dma::new(system.dma, &mut system.peripheral_clock_control);
+
     display.clear(display::BACKGROUND).unwrap();
     display::flush(&mut display).unwrap();
 
     //   spawner.spawn(connection_wifi(controller)).ok();
     //   spawner.spawn(net_task(stack)).ok();
     spawner
-        .spawn(task(input, stack, seed.into(), display, rtc))
+        .spawn(task(
+            input,
+            stack,
+            seed.into(),
+            display,
+            rtc,
+            dma.spi2channel,
+        ))
         .ok();
 }
 
@@ -265,6 +283,7 @@ async fn task(
     _seed: u64,
     mut display: DISPLAY<'static>,
     rtc: Rtc<'static>,
+    dma_channel: Spi2DmaChannelCreator,
 ) {
     let png_bytes = include_bytes!("../test-tile.png");
 
@@ -275,7 +294,7 @@ async fn task(
     let end = rtc.get_time_us();
     println!("minipng decoded in {}us", end - start);
 
-    let pixel_buffer_2 = make_static!(heapless::Vec::<u8, { 256 * 140 * 2 }>::new());
+    let pixel_buffer_2 = make_static!(heapless::Vec::<u8, { 256 * 100 * 2 }>::new());
 
     image_data
         .pixels()
@@ -293,6 +312,16 @@ async fn task(
     let (di, m, _) = display.release();
     let (mut spi, mut dc) = di.release();
 
+    let mut descriptors = [0u32; 8 * 3];
+    let mut rx_descriptors = [0u32; 8 * 3];
+
+    let mut spi = spi.with_dma(dma_channel.configure(
+        false,
+        &mut descriptors,
+        &mut rx_descriptors,
+        DmaPriority::Priority0,
+    ));
+
     loop {
         Timer::after(Duration::from_millis(0)).await;
 
@@ -302,23 +331,44 @@ async fn task(
 
         // 1 = data, 0 = command
 
+        use esp32_hal::prelude::_embedded_hal_async_spi_SpiBus as SpiBus;
+
+        let mut dummy_read_buf = [0u8; 8];
+
         // Set Column Address
         dc.set_low().unwrap();
-        spi.write(&[0x2A]).unwrap();
+        // fails with: DmaError(DescriptorError)
+        SpiBus::transfer(&mut spi, &mut dummy_read_buf, &[0x2A; 8])
+            .await
+            .unwrap();
         dc.set_high().unwrap();
-        spi.write(&[0, 0, 0, 255]).unwrap();
+        SpiBus::transfer(&mut spi, &mut dummy_read_buf, &[0, 0, 0, 255])
+            .await
+            .unwrap();
+        println!("SCA cmd data sent");
 
         // Set Page Address
         dc.set_low().unwrap();
-        spi.write(&[0x2B]).unwrap();
+        SpiBus::transfer(&mut spi, &mut dummy_read_buf, &[0x2B; 8])
+            .await
+            .unwrap();
         dc.set_high().unwrap();
-        spi.write(&[0, 0, 0, 239]).unwrap();
+        SpiBus::transfer(&mut spi, &mut dummy_read_buf, &[0, 0, 0, 239])
+            .await
+            .unwrap();
+        println!("SPA cmd data sent");
 
         // Write Memory Start
         dc.set_low().unwrap();
-        spi.write(&[0x2C]).unwrap();
+        SpiBus::transfer(&mut spi, &mut dummy_read_buf, &[0x2C; 8])
+            .await
+            .unwrap();
         dc.set_high().unwrap();
-        spi.write(pixel_buffer_2).unwrap();
+        //       for chunk in pixel_buffer_2.chunks(32768) {
+        //           SpiBus::transfer(&mut spi, &mut dummy_read_buf, chunk)
+        //               .await
+        //               .unwrap();
+        //       }
 
         let end = rtc.get_time_us();
         println!("rendered in {}us", end - start);
