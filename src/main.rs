@@ -329,7 +329,7 @@ async fn task(
         DmaPriority::Priority0,
     ));
 
-    let Aligned(mut cmd_buf) = make_static!(Aligned([0u8; 8]));
+    let Aligned(mut cmd_buf) = make_static!(Aligned([0u8; 4]));
 
     loop {
         Timer::after(Duration::from_millis(0)).await;
@@ -375,7 +375,7 @@ async fn task(
     }
 }
 
-#[repr(align(8))]
+#[repr(align(4))]
 struct Aligned<T>(T);
 
 // TODO: something like this should be in `incremental-png` itself
