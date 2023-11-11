@@ -35,7 +35,7 @@ pub use esp32c6_hal as hal;
 
 #[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
 use hal::systimer::SystemTimer;
-use hal::Rng;
+use hal::{Rng, peripherals};
 use hal::{
     clock::ClockControl, embassy, gpio::*, peripherals::Peripherals, prelude::*, timer::TimerGroup,
     Rtc, IO,
@@ -123,6 +123,37 @@ mod display {
 }
 
 use display::DISPLAY;
+
+
+pub struct MyIrq<const N: u8>(GpioPin<Input<PullUp>, N>);
+
+impl xpt2046::Xpt2046Exti for MyIrq<36> {
+    type Exti = ();
+    fn clear_interrupt(&mut self) {
+        self.0.clear_interrupt()
+    }
+    fn disable_interrupt(&mut self, exti: &mut Self::Exti) {
+        hal::interrupt::disable(
+            hal::get_core(),
+            hal::peripherals::Interrupt::GPIO
+        )
+    }
+
+    fn enable_interrupt(&mut self, exti: &mut Self::Exti) {
+        hal::interrupt::enable(
+            hal::peripherals::Interrupt::GPIO,
+            hal::interrupt::Priority::Priority1,
+        ).unwrap()
+    }
+
+    fn is_high(&self) -> bool {
+        self.0.is_high().unwrap()
+    }
+
+    fn is_low(&self) -> bool {
+        self.0.is_low().unwrap()
+    }
+ }
 
 #[embassy_macros::main_riscv(entry = "hal::entry")]
 async fn main(spawner: embassy_executor::Spawner) {
@@ -251,6 +282,45 @@ async fn main(spawner: embassy_executor::Spawner) {
     display.clear(display::BACKGROUND).unwrap();
     display::flush(&mut display).unwrap();
 
+
+    
+    let mut touch = {
+        use hal::{spi::SpiMode, Delay, Spi};
+        use xpt2046::{Xpt2046, Orientation};
+        
+        let mut touch_irq = io.pins.gpio36.into_pull_up_input();
+
+
+        // Define the SPI pins and create the SPI interface
+        let sck = io.pins.gpio25;
+        let miso = io.pins.gpio32;
+        let mosi = io.pins.gpio39.into();
+        let cs = io.pins.gpio33.into_push_pull_output();
+        let spi = Spi::new(
+            peripherals.SPI3,
+            sck,
+            mosi,
+            miso,
+            cs,
+            2_u32.MHz(),
+            SpiMode::Mode1,
+            &mut system.peripheral_clock_control,
+            &clocks,
+        );
+
+        
+        let mut delay = Delay::new(&clocks);
+
+
+        let mut xpt_drv = Xpt2046::new(
+            spi,
+            cs,
+            MyIrq(touch_irq),
+            Orientation::PortraitFlipped,
+        );
+        xpt_drv.init(&mut delay);
+        xpt_drv
+    };
     //   spawner.spawn(connection_wifi(controller)).ok();
     //   spawner.spawn(net_task(stack)).ok();
     spawner

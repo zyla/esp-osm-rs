@@ -55,7 +55,7 @@ default = ["esp32"]
 
 esp32c3 = ["esp32c3-hal", "esp-backtrace/esp32c3", "esp-println/esp32c3", "esp-wifi/esp32c3", "embassy-executor/arch-riscv32"]
 esp32c6 = ["esp32c6-hal", "esp-backtrace/esp32c6", "esp-println/esp32c6", "esp-wifi/esp32c6", "embassy-executor/arch-riscv32"]
-esp32 = ["esp32-hal", "esp-backtrace/esp32", "esp-println/esp32", "esp-wifi/esp32", "embassy-executor/arch-xtensa"]
+esp32 = ["esp32-hal", "esp-backtrace/esp32", "esp-println/esp32", "esp-wifi/esp32", "embassy-executor/arch-xtensa", "esp32-hal/eh1"]
 
 [profile.dev.package.esp-wifi]
 opt-level = 3
