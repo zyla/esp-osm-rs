@@ -4,7 +4,7 @@
 #![feature(iter_collect_into)]
 #![feature(async_closure)]
 #![allow(clippy::upper_case_acronyms)]
-
+#![allow(unused)]
 extern crate alloc;
 use crate::hal::dma::DmaPriority;
 use crate::hal::pdma::Dma;

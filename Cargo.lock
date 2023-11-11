@@ -680,6 +680,7 @@ dependencies = [
  "mipidsi",
  "reqwless",
  "smoltcp",
+ "spin",
  "static_cell",
  "xpt2046",
 ]
