@@ -13,7 +13,7 @@ use embassy_net::{
     Config, Stack, StackResources,
 };
 use embassy_time::{Duration, Timer};
-use embedded_graphics::pixelcolor::{Rgb565, Rgb666};
+use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::{
     pixelcolor::{Gray8, Rgb888},
     prelude::Dimensions,
@@ -289,7 +289,7 @@ async fn task(
                     .iter()
                     .map(|&index| {
                         let rgb = image_data.palette(index);
-                        Rgb666::new(rgb[1], rgb[2], rgb[0]).into()
+                        Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3)
                     })
                     .take(256 * 240),
             )
