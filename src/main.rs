@@ -25,9 +25,11 @@ use embedded_graphics::{
 };
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp_backtrace as _;
+use esp_println::print;
 use esp_println::println;
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiMode, WifiState};
 use esp_wifi::{initialize, EspWifiInitFor};
+use incremental_png::Palette;
 
 #[cfg(feature = "esp32")]
 pub use esp32_hal as hal;
@@ -57,6 +59,7 @@ use incremental_png::{
 use mipidsi::dcs::SetColumnAddress;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
+use smoltcp::wire::TcpControl;
 use static_cell::make_static;
 
 const SSID: &str = env!("SSID");
@@ -296,25 +299,50 @@ async fn task(
 
     println!("num png bytes: {}", png_bytes.len());
     let start = rtc.get_time_us();
-    let pixel_buffer = make_static!([0u8; 256 * 256 + 256]);
-    let image_data = minipng::decode_png(png_bytes, pixel_buffer).unwrap();
+    const MINI_TILE_SIZE: usize = 64 * 64 * 2;
+    static mut PIXEL_BUFFER_1: heapless::Vec<u8, { MINI_TILE_SIZE * 9 }> = heapless::Vec::new();
+    #[link_section = ".dram2_uninit"]
+    static mut PIXEL_BUFFER_2: [u8; MINI_TILE_SIZE * 11] = [0; MINI_TILE_SIZE * 11];
+
+    let pixel_buffer_1 = unsafe { &mut PIXEL_BUFFER_1 };
+    let pixel_buffer_2 = unsafe { &mut PIXEL_BUFFER_2 };
+    let mut pixel_buffer_2_index: usize = 0;
+
+    let mut png = PngReader::new();
+
+    png.process_data::<()>(png_bytes, |palette, event| {
+        match event {
+            inflater::Event::ImageHeader(header) => println!("{:?}", header),
+            inflater::Event::ImageData(pixels) => {
+                let iter = pixels.iter().flat_map(|&index| {
+                    let rgb = palette.color_at(index);
+                    let u = Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3)
+                        .into_storage()
+                        .to_be_bytes();
+                    u
+                });
+                let first = iter
+                    .clone()
+                    .take(pixel_buffer_1.capacity() - pixel_buffer_1.len());
+                let second = iter
+                    .clone()
+                    .skip(pixel_buffer_1.capacity() - pixel_buffer_1.len())
+                    .take(pixel_buffer_2.len() - pixel_buffer_2_index);
+
+                pixel_buffer_1.extend(first);
+
+                for b in second {
+                    pixel_buffer_2[pixel_buffer_2_index] = b;
+                    pixel_buffer_2_index += 1;
+                }
+            }
+            inflater::Event::End => {}
+        }
+        ControlFlow::Continue(())
+    });
+
     let end = rtc.get_time_us();
-    println!("minipng decoded in {}us", end - start);
-
-    let pixel_buffer_2 = make_static!(heapless::Vec::<u8, { 256 * 100 * 2 }>::new());
-
-    image_data
-        .pixels()
-        .iter()
-        .flat_map(|&index| {
-            let rgb = image_data.palette(index);
-            let u = Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3)
-                .into_storage()
-                .to_be_bytes();
-            u
-        })
-        .take(pixel_buffer_2.capacity())
-        .collect_into(pixel_buffer_2);
+    println!("incremental-png decoded in {}us", end - start);
 
     let (di, _, _) = display.release();
     let (spi, mut dc) = di.release();
@@ -342,13 +370,13 @@ async fn task(
         dc.set_low().unwrap();
         Write::write(&mut spi, &[0x2A]).unwrap();
         dc.set_high().unwrap();
-        Write::write(&mut spi, &[0, 0, 0, 255]).unwrap();
+        Write::write(&mut spi, &[0, 0, 1, 0]).unwrap();
 
         // Set Page Address
         dc.set_low().unwrap();
         Write::write(&mut spi, &[0x2B]).unwrap();
         dc.set_high().unwrap();
-        Write::write(&mut spi, &[0, 0, 0, 239]).unwrap();
+        Write::write(&mut spi, &[0, 0, 1, 0]).unwrap();
 
         // Write Memory Start
         dc.set_low().unwrap();
@@ -356,12 +384,17 @@ async fn task(
         dc.set_high().unwrap();
 
         // Simulate drawing "mini-tiles" 64x64
-        for chunk in pixel_buffer_2.chunks(64 * 64 * 2) {
-            SpiBus::write(&mut spi, chunk).await.unwrap();
+        for buf in [
+            pixel_buffer_1.as_slice(),
+            &pixel_buffer_2.as_slice()[..256 * 240 * 2 - pixel_buffer_1.len()],
+        ] {
+            for chunk in buf.chunks(64 * 64 * 2) {
+                SpiBus::write(&mut spi, chunk).await.unwrap();
+            }
         }
 
         let end = rtc.get_time_us();
-        println!("rendered in {}us", end - start);
+        print!("rendered in {}us\r", end - start);
     }
 }
 
@@ -369,7 +402,7 @@ async fn task(
 struct PngReader {
     dechunker: Dechunker,
     sd: StreamDecoder,
-    inflater: Inflater<16384>,
+    inflater: Inflater<1024>,
 }
 
 impl PngReader {
@@ -381,14 +414,11 @@ impl PngReader {
         }
     }
 
-    async fn process_data<B, R>(
+    fn process_data<B>(
         &mut self,
         mut input: &[u8],
-        mut block: impl FnMut(inflater::Event) -> R,
-    ) -> ControlFlow<B>
-    where
-        R: Future<Output = ControlFlow<B>>,
-    {
+        mut block: impl FnMut(&Palette, inflater::Event) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
         while !input.is_empty() {
             let (consumed, mut dc_event) = self
                 .dechunker
@@ -408,7 +438,7 @@ impl PngReader {
                     let (leftover, i_event) = self.inflater.update(e).unwrap();
 
                     if let Some(e) = i_event {
-                        block(e).await?;
+                        block(self.sd.palette(), e)?;
                     }
 
                     sd_event = leftover;
@@ -456,4 +486,55 @@ async fn connection_wifi(mut controller: WifiController<'static>) {
 #[embassy_executor::task]
 async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
     stack.run().await
+}
+
+mod tile_cache {
+    use core::{marker::PhantomData, sync::atomic::AtomicBool};
+
+    const BYTES_PER_PIXEL: usize = 2;
+    const TILE_WIDTH: usize = 64;
+
+    type TileData = [u8; TILE_WIDTH * TILE_WIDTH * BYTES_PER_PIXEL];
+
+    /// Tile addressing - based on <https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames>, but
+    /// slightly modified.
+    ///
+    /// Zoom level is as in the original scheme. However, x and y a are 2 bits larger, since every
+    /// standard tile contains 16 mini tiles.
+    ///
+    /// In the original scheme coordinates have max 18 bits. In our scheme - 20 bits.
+    /// We could use a more efficient representation (48 bits are enough).
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
+    struct TileId {
+        zoom_level: u8,
+        x: u32,
+        y: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct TileDescriptor {
+        id: Option<TileId>,
+        data: *mut TileData,
+    }
+
+    impl TileDescriptor {
+        pub const fn new(data: *mut TileData) -> Self {
+            Self { id: None, data }
+        }
+    }
+
+    pub struct TileGuard<'a> {
+        ptr: *mut TileData,
+        phantom: PhantomData<&'a ()>,
+    }
+
+    pub struct TileCache<Ds> {
+        descriptors: Ds,
+    }
+
+    impl<Ds: AsMut<[TileDescriptor]>> TileCache<Ds> {
+        pub const fn new(ds: Ds) -> Self {
+            Self { descriptors: ds }
+        }
+    }
 }
