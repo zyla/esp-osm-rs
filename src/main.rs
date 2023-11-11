@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
+#![feature(iter_collect_into)]
 #![feature(async_closure)]
 #![allow(clippy::upper_case_acronyms)]
 
@@ -14,6 +15,7 @@ use embassy_net::{
 };
 use embassy_time::{Duration, Timer};
 use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::prelude::IntoStorage;
 use embedded_graphics::{
     pixelcolor::{Gray8, Rgb888},
     prelude::Dimensions,
@@ -46,6 +48,7 @@ use incremental_png::{
     inflater::{self, Inflater},
     stream_decoder::{Event, ImageHeader, StreamDecoder},
 };
+use mipidsi::dcs::SetColumnAddress;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
 use static_cell::make_static;
@@ -272,28 +275,51 @@ async fn task(
     let end = rtc.get_time_us();
     println!("minipng decoded in {}us", end - start);
 
+    let pixel_buffer_2 = make_static!(heapless::Vec::<u8, { 256 * 140 * 2 }>::new());
+
+    image_data
+        .pixels()
+        .iter()
+        .flat_map(|&index| {
+            let rgb = image_data.palette(index);
+            let u = Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3)
+                .into_storage()
+                .to_be_bytes();
+            u
+        })
+        .take(pixel_buffer_2.capacity())
+        .collect_into(pixel_buffer_2);
+
+    let (di, m, _) = display.release();
+    let (mut spi, mut dc) = di.release();
+
     loop {
         Timer::after(Duration::from_millis(0)).await;
 
         println!("render start");
 
         let start = rtc.get_time_us();
-        display
-            .set_pixels(
-                0,
-                0,
-                255,
-                239,
-                image_data
-                    .pixels()
-                    .iter()
-                    .map(|&index| {
-                        let rgb = image_data.palette(index);
-                        Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3)
-                    })
-                    .take(256 * 240),
-            )
-            .unwrap();
+
+        // 1 = data, 0 = command
+
+        // Set Column Address
+        dc.set_low().unwrap();
+        spi.write(&[0x2A]).unwrap();
+        dc.set_high().unwrap();
+        spi.write(&[0, 0, 0, 255]).unwrap();
+
+        // Set Page Address
+        dc.set_low().unwrap();
+        spi.write(&[0x2B]).unwrap();
+        dc.set_high().unwrap();
+        spi.write(&[0, 0, 0, 239]).unwrap();
+
+        // Write Memory Start
+        dc.set_low().unwrap();
+        spi.write(&[0x2C]).unwrap();
+        dc.set_high().unwrap();
+        spi.write(pixel_buffer_2).unwrap();
+
         let end = rtc.get_time_us();
         println!("rendered in {}us", end - start);
     }
