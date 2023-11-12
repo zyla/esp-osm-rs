@@ -600,6 +600,11 @@ where
         let display_row_start: u16 = core::cmp::max(target_y, 0) as u16;
         let display_row_end: u16 = display_row_start + height as u16 - 1;
 
+        if width == 0 || height == 0 {
+            // Tile is offscreen
+            return;
+        }
+
         let mut params = [0u8; 4];
 
         // Set Column Address
