@@ -523,8 +523,8 @@ async fn task(
 
         let mut total = 0;
 
-        for tile_x in first_tile_x..first_tile_x + DISPLAY_WIDTH / TILE_WIDTH + 1 {
-            for tile_y in first_tile_y..first_tile_y + DISPLAY_HEIGHT / TILE_WIDTH + 1 {
+        for tile_x in first_tile_x..first_tile_x + DISPLAY_WIDTH / TILE_WIDTH + 2 {
+            for tile_y in first_tile_y..first_tile_y + DISPLAY_HEIGHT / TILE_WIDTH + 2 {
                 let tile_id = TileId {
                     zoom_level,
                     x: tile_x as u32,
@@ -559,7 +559,7 @@ async fn task(
 }
 
 // A bit smaller until we have PSRAM
-const DISPLAY_WIDTH: usize = 256;
+const DISPLAY_WIDTH: usize = 240;
 const DISPLAY_HEIGHT: usize = 240;
 
 struct Display2<SPI, DC> {
@@ -588,14 +588,25 @@ where
         // Clip the tile if needed
         let tile_offset_x = -core::cmp::min(target_x, 0);
         let tile_offset_y = -core::cmp::min(target_y, 0);
-        let width = core::cmp::min(
-            TILE_WIDTH as i32 - tile_offset_x,
-            DISPLAY_WIDTH as i32 - target_x,
+        let width = core::cmp::max(
+            0,
+            core::cmp::min(
+                TILE_WIDTH as i32 - tile_offset_x,
+                DISPLAY_WIDTH as i32 - target_x,
+            ),
         );
-        let height = core::cmp::min(
-            TILE_WIDTH as i32 - tile_offset_y,
-            DISPLAY_HEIGHT as i32 - target_y,
+        let height = core::cmp::max(
+            0,
+            core::cmp::min(
+                TILE_WIDTH as i32 - tile_offset_y,
+                DISPLAY_HEIGHT as i32 - target_y,
+            ),
         );
+
+        if width == 0 || height == 0 {
+            // Tile is offscreen
+            return;
+        }
 
         // Clipping in X axis requires more DMA transfers, unfortunately
         let clipped_x = tile_offset_x > 0 || width < TILE_WIDTH as i32;
@@ -604,11 +615,6 @@ where
         let display_col_end: u16 = display_col_start + width as u16 - 1;
         let display_row_start: u16 = core::cmp::max(target_y, 0) as u16;
         let display_row_end: u16 = display_row_start + height as u16 - 1;
-
-        if width == 0 || height == 0 {
-            // Tile is offscreen
-            return;
-        }
 
         let mut params = [0u8; 4];
 
