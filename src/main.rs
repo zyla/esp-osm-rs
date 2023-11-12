@@ -641,12 +641,15 @@ where
                 for y in tile_offset_y..tile_offset_y + height {
                     let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL
                         + tile_offset_x as usize * BYTES_PER_PIXEL;
-                    SpiBus::write(
-                        &mut self.spi,
-                        &data[off..off + width as usize * BYTES_PER_PIXEL],
-                    )
-                    .await
-                    .unwrap();
+                    let n = width as usize * BYTES_PER_PIXEL;
+                    if n >= MIN_ASYNC_TRANSFER_SIZE {
+                        SpiBus::write(&mut self.spi, &data[off..off + n])
+                            .await
+                            .unwrap();
+                    } else {
+                        //                        println!("transfer {n}");
+                        SpiWrite::write(&mut self.spi, &data[off..off + n]).unwrap();
+                    }
                 }
             }
         } else {
@@ -659,7 +662,11 @@ where
             let mut num_bytes = (width * height) as usize * BYTES_PER_PIXEL;
             while num_bytes > 0 {
                 let n = core::cmp::min(num_bytes, ZEROS.len());
-                SpiBus::write(&mut self.spi, &ZEROS[..n]).await.unwrap();
+                if n >= MIN_ASYNC_TRANSFER_SIZE {
+                    SpiBus::write(&mut self.spi, &ZEROS[..n]).await.unwrap();
+                } else {
+                    SpiWrite::write(&mut self.spi, &ZEROS[..n]).unwrap();
+                }
                 num_bytes -= n;
             }
         }
@@ -667,6 +674,8 @@ where
         //       print!("transfer took {}us\n", end - start);
     }
 }
+
+const MIN_ASYNC_TRANSFER_SIZE: usize = 32;
 
 #[link_section = ".bss"]
 static ZEROS: [u8; 256] = [0; _];
