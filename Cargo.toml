@@ -13,6 +13,9 @@ embassy-time = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
 embassy-macros = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
 embassy-sync = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
 
+esp-hal-common = { path = "./libs/esp-hal/esp-hal-common" }
+esp32-hal = { path = "./libs/esp-hal/esp32-hal" }
+
 [dependencies]
 esp-backtrace = { version = "0.8.0", features = ["panic-handler", "exception-handler", "print-uart"] }
 esp-println = { version = "0.6.0", features = ["log"] }
@@ -40,17 +43,20 @@ embedded-text = "0.6.6"
 # chips
 esp32c3-hal = { version = "0.12.0", features=["embassy","async","embassy-time-timg0"], optional = true }
 esp32c6-hal = { version = "0.5.0", features=["embassy","async","embassy-time-timg0"], optional = true }
-esp32-hal = { version = "0.15.0", features=["embassy","async","embassy-time-timg0","eh1"], optional = true }
+esp32-hal = { version = "0.15.0", features=["embassy","async","embassy-time-timg0","eh1","log"], optional = true }
 
 display-interface = { version = "0.4.1" }
 display-interface-spi = "0.4.1"
 
-incremental-png = { git = "https://github.com/zyla/incremental-png", rev = "e05eaf91f8fd8d10f0dca7ba461c6190520c4f94" }
+#incremental-png = { git = "https://github.com/zyla/incremental-png", rev = "e05eaf91f8fd8d10f0dca7ba461c6190520c4f94" }
+incremental-png = { path = "../incremental-png" }
+
 embedded-io-async = "0.6.0"
 mipidsi = { version = "0.7.1" }
 xpt2046 = { version = "0.3.1", path = "libs/xpt2046" }
 minipng = "0.1.1"
 embedded-hal-1 = { version = "=1.0.0-rc.1", package = "embedded-hal" }
+spin = "0.9.8"
 
 [features]
 default = ["esp32"]
@@ -84,6 +90,12 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.display-interface-spi]
+opt-level = 3
+
+[profile.dev.package.esp-hal-common]
+opt-level = 3
+
+[profile.dev.package.esp32-hal]
 opt-level = 3
 
 [profile.dev.package.esp-osm]
