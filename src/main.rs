@@ -3,12 +3,17 @@
 #![feature(type_alias_impl_trait)]
 #![feature(iter_collect_into)]
 #![feature(async_closure)]
+#![feature(const_mut_refs)]
+#![feature(generic_arg_infer)]
 #![allow(clippy::upper_case_acronyms)]
-
+#![allow(non_camel_case_types)]
+#![allow(unused)]
 extern crate alloc;
 use crate::hal::dma::DmaPriority;
 use crate::hal::pdma::Dma;
 use crate::hal::pdma::Spi2DmaChannelCreator;
+use crate::tile_cache::TileDescriptor;
+use crate::tile_cache::TileId;
 use core::future::Future;
 use core::{alloc::GlobalAlloc, ops::ControlFlow, str};
 use embassy_net::{
@@ -25,9 +30,11 @@ use embedded_graphics::{
 };
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp_backtrace as _;
+use esp_println::print;
 use esp_println::println;
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiMode, WifiState};
 use esp_wifi::{initialize, EspWifiInitFor};
+use incremental_png::Palette;
 
 #[cfg(feature = "esp32")]
 pub use esp32_hal as hal;
@@ -57,6 +64,7 @@ use incremental_png::{
 use mipidsi::dcs::SetColumnAddress;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
+use smoltcp::wire::TcpControl;
 use static_cell::make_static;
 
 const SSID: &str = env!("SSID");
@@ -129,6 +137,10 @@ mod display {
 }
 
 use display::DISPLAY;
+use tile_cache::TileCache;
+use tile_cache::TileDataGuard;
+use tile_cache::BYTES_PER_PIXEL;
+use tile_cache::TILE_WIDTH;
 
 #[embassy_macros::main_riscv(entry = "hal::entry")]
 async fn main(spawner: embassy_executor::Spawner) {
@@ -267,6 +279,8 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     let delay = Delay::new(&clocks);
 
+    let tile_cache = make_static!(init_tile_cache());
+
     //   spawner.spawn(connection_wifi(controller)).ok();
     //   spawner.spawn(net_task(stack)).ok();
     spawner
@@ -278,8 +292,26 @@ async fn main(spawner: embassy_executor::Spawner) {
             delay,
             rtc,
             dma.spi2channel,
+            tile_cache,
         ))
         .ok();
+}
+
+static mut TILES_1: [tile_cache::TileData; 8] = tile_cache::empty();
+#[link_section = ".dram2_uninit"]
+static mut TILES_2: [tile_cache::TileData; 11] = tile_cache::empty();
+
+type TILE_CACHE = TileCache<'static>;
+
+fn init_tile_cache() -> TILE_CACHE {
+    let descriptors: &mut heapless::Vec<tile_cache::TileDescriptor<'static>, { 9 + 11 }> =
+        make_static!(heapless::Vec::from_iter(
+            unsafe { &mut TILES_1 }
+                .iter_mut()
+                .chain(unsafe { &mut TILES_2 }.iter_mut())
+                .map(TileDescriptor::new)
+        ));
+    TileCache::new(descriptors.as_slice())
 }
 
 #[embassy_executor::task]
@@ -291,77 +323,311 @@ async fn task(
     mut delay: Delay,
     rtc: Rtc<'static>,
     dma_channel: Spi2DmaChannelCreator,
+    tile_cache: &'static TILE_CACHE,
 ) {
     let png_bytes = include_bytes!("../test-tile.png");
 
     println!("num png bytes: {}", png_bytes.len());
     let start = rtc.get_time_us();
-    let pixel_buffer = make_static!([0u8; 256 * 256 + 256]);
-    let image_data = minipng::decode_png(png_bytes, pixel_buffer).unwrap();
+
+    let mut td = TileDecoder::new(
+        tile_cache,
+        BigTileId {
+            zoom_level: 18,
+            x: 146372,
+            y: 86317,
+        },
+    );
+    td.process_data(png_bytes);
+    td.finish();
+
     let end = rtc.get_time_us();
-    println!("minipng decoded in {}us", end - start);
-
-    let pixel_buffer_2 = make_static!(heapless::Vec::<u8, { 256 * 100 * 2 }>::new());
-
-    image_data
-        .pixels()
-        .iter()
-        .flat_map(|&index| {
-            let rgb = image_data.palette(index);
-            let u = Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3)
-                .into_storage()
-                .to_be_bytes();
-            u
-        })
-        .take(pixel_buffer_2.capacity())
-        .collect_into(pixel_buffer_2);
+    println!("incremental-png decoded in {}us", end - start);
 
     let (di, _, _) = display.release();
-    let (spi, mut dc) = di.release();
+    let (spi, dc) = di.release();
 
     let descriptors = make_static!([0u32; 8 * 3]);
     let rx_descriptors = make_static!([0u32; 8 * 3]);
 
-    let mut spi = FlashSafeDma::<_, 8>::new(spi.with_dma(dma_channel.configure(
+    let spi = FlashSafeDma::<_, 8>::new(spi.with_dma(dma_channel.configure(
         false,
         descriptors,
         rx_descriptors,
         DmaPriority::Priority0,
     )));
 
+    let mut display = Display2::new(spi, dc);
+
+    let mut zoom_level = 0;
+    let mut global_x = 0;
+    let mut global_y = 0;
+
+    zoom_level = 18;
+    global_x = 146372 * 256 + 5;
+    global_y = 86317 * 256 + 26;
+
     loop {
         Timer::after(Duration::from_millis(0)).await;
 
         let start = rtc.get_time_us();
 
-        // 1 = data, 0 = command
-        use crate::hal::prelude::_embedded_hal_async_spi_SpiBus as SpiBus;
-        use crate::hal::prelude::_embedded_hal_blocking_spi_Write as Write;
+        let first_tile_x = global_x / TILE_WIDTH;
+        let first_tile_y = global_y / TILE_WIDTH;
 
-        // Set Column Address
-        dc.set_low().unwrap();
-        Write::write(&mut spi, &[0x2A]).unwrap();
-        dc.set_high().unwrap();
-        Write::write(&mut spi, &[0, 0, 0, 255]).unwrap();
+        let mut total = 0;
 
-        // Set Page Address
-        dc.set_low().unwrap();
-        Write::write(&mut spi, &[0x2B]).unwrap();
-        dc.set_high().unwrap();
-        Write::write(&mut spi, &[0, 0, 0, 239]).unwrap();
+        for tile_x in first_tile_x..first_tile_x + DISPLAY_WIDTH / TILE_WIDTH + 1 {
+            for tile_y in first_tile_y..first_tile_y + DISPLAY_HEIGHT / TILE_WIDTH + 1 {
+                let tile_id = TileId {
+                    zoom_level,
+                    x: tile_x as u32,
+                    y: tile_y as u32,
+                };
 
-        // Write Memory Start
-        dc.set_low().unwrap();
-        Write::write(&mut spi, &[0x2C]).unwrap();
-        dc.set_high().unwrap();
+                let target_x = -((global_x % TILE_WIDTH) as i32)
+                    + ((tile_x - first_tile_x) * TILE_WIDTH) as i32;
+                let target_y = -((global_y % TILE_WIDTH) as i32)
+                    + ((tile_y - first_tile_y) * TILE_WIDTH) as i32;
+                //               println!(
+                //                   "Draw tile ({},{}) at ({}, {})",
+                //                   tile_id.x, tile_id.y, target_x, target_y
+                //               );
 
-        // Simulate drawing "mini-tiles" 64x64
-        for chunk in pixel_buffer_2.chunks(64 * 64 * 2) {
-            SpiBus::write(&mut spi, chunk).await.unwrap();
+                if let Some(data) = tile_cache.lookup(tile_id).and_then(|td| td.try_lock_data()) {
+                    display.draw_tile(&rtc, target_x, target_y, *data).await;
+                }
+            }
         }
 
         let end = rtc.get_time_us();
-        println!("rendered in {}us", end - start);
+        print!("rendered in {}us\r", end - start);
+
+        //        Timer::after_millis(10000).await;
+    }
+}
+
+// A bit smaller until we have PSRAM
+const DISPLAY_WIDTH: usize = 320;
+const DISPLAY_HEIGHT: usize = 240;
+
+struct Display2<SPI, DC> {
+    spi: SPI,
+    dc: DC,
+}
+use crate::hal::prelude::_embedded_hal_async_spi_SpiBus as SpiBus;
+use crate::hal::prelude::_embedded_hal_blocking_spi_Write as SpiWrite;
+
+impl<SPI: SpiBus + SpiWrite<u8>, DC: _embedded_hal_digital_v2_OutputPin> Display2<SPI, DC>
+where
+    <SPI as SpiWrite<u8>>::Error: core::fmt::Debug,
+    <DC as _embedded_hal_digital_v2_OutputPin>::Error: core::fmt::Debug,
+{
+    pub fn new(spi: SPI, dc: DC) -> Self {
+        Self { spi, dc }
+    }
+
+    pub async fn draw_tile(
+        &mut self,
+        rtc: &Rtc<'static>,
+        target_x: i32,
+        target_y: i32,
+        data: &[u8],
+    ) {
+        // Clip the tile if needed
+        let tile_offset_x = -core::cmp::min(target_x, 0);
+        let tile_offset_y = -core::cmp::min(target_y, 0);
+        let width = core::cmp::min(
+            TILE_WIDTH as i32 - tile_offset_x,
+            DISPLAY_WIDTH as i32 - target_x,
+        );
+        let height = core::cmp::min(
+            TILE_WIDTH as i32 - tile_offset_y,
+            DISPLAY_HEIGHT as i32 - target_y,
+        );
+
+        // Clipping in X axis requires more DMA transfers, unfortunately
+        let clipped_x = tile_offset_x > 0 || width < TILE_WIDTH as i32;
+
+        let display_col_start: u16 = core::cmp::max(target_x, 0) as u16;
+        let display_col_end: u16 = display_col_start + width as u16 - 1;
+        let display_row_start: u16 = core::cmp::max(target_y, 0) as u16;
+        let display_row_end: u16 = display_row_start + height as u16 - 1;
+
+        let mut params = [0u8; 4];
+
+        //        println!("Set_Column_Address({display_col_start}, {display_col_end})");
+
+        // Set Column Address
+        self.dc.set_low().unwrap();
+        SpiWrite::write(&mut self.spi, &[0x2A]).unwrap();
+        self.dc.set_high().unwrap();
+        params[0..2].copy_from_slice(&display_col_start.to_be_bytes());
+        params[2..4].copy_from_slice(&display_col_end.to_be_bytes());
+        SpiWrite::write(&mut self.spi, &params).unwrap();
+
+        //       println!("Set_Page_Address({display_row_start}, {display_row_end})");
+
+        // Set Page Address
+        self.dc.set_low().unwrap();
+        SpiWrite::write(&mut self.spi, &[0x2B]).unwrap();
+        self.dc.set_high().unwrap();
+        params[0..2].copy_from_slice(&display_row_start.to_be_bytes());
+        params[2..4].copy_from_slice(&display_row_end.to_be_bytes());
+        SpiWrite::write(&mut self.spi, &params).unwrap();
+
+        // SpiWrite Memory Start
+        self.dc.set_low().unwrap();
+        SpiWrite::write(&mut self.spi, &[0x2C]).unwrap();
+        self.dc.set_high().unwrap();
+
+        //        let start = rtc.get_time_us();
+
+        //      println!("Tile rect: ({tile_offset_x}, {tile_offset_y}, {width}, {height})");
+
+        if !clipped_x {
+            // Easy case: one transfer
+            SpiBus::write(
+                &mut self.spi,
+                &data[tile_offset_y as usize * TILE_WIDTH * BYTES_PER_PIXEL
+                    ..(tile_offset_y + height) as usize * TILE_WIDTH * BYTES_PER_PIXEL],
+            )
+            .await
+            .unwrap();
+        } else {
+            // Transfer each row separately
+
+            for y in tile_offset_y..tile_offset_y + height {
+                let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL
+                    + tile_offset_x as usize * BYTES_PER_PIXEL;
+                SpiBus::write(
+                    &mut self.spi,
+                    &data[off..off + width as usize * BYTES_PER_PIXEL],
+                )
+                .await
+                .unwrap();
+            }
+        }
+        //       let end = rtc.get_time_us();
+        //       print!("transfer took {}us\n", end - start);
+    }
+}
+
+/// Standard slippy map tile address - based on <https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames>
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+pub struct BigTileId {
+    pub zoom_level: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
+struct TileDecoder<'a> {
+    cache: &'a TileCache<'a>,
+    tile_id: BigTileId,
+    png: PngReader,
+    current_row_tiles: [Option<TileDataGuard<'a>>; 4],
+    x: usize,
+    y: usize,
+}
+
+const BIG_TILE_WIDTH: usize = 256;
+
+impl<'a> TileDecoder<'a> {
+    fn new(cache: &'a TileCache<'a>, tile_id: BigTileId) -> Self {
+        Self {
+            cache,
+            tile_id,
+            png: PngReader::new(),
+            current_row_tiles: Default::default(),
+            x: 0,
+            y: 0,
+        }
+    }
+
+    fn finish(&mut self) {
+        // Unlock tiles
+        self.current_row_tiles = Default::default();
+    }
+
+    fn update_tiles(
+        cache: &'a TileCache<'a>,
+        current_row_tiles: &mut [Option<TileDataGuard<'a>>; 4],
+        tile_id: BigTileId,
+        y: usize,
+    ) {
+        for (i, g) in current_row_tiles.iter_mut().enumerate() {
+            match cache.find_empty() {
+                None => {
+                    // No space in cache, skip the tile
+                    // TODO: evict something
+                    *g = None;
+                }
+                Some(td) => {
+                    let tile_id = TileId {
+                        zoom_level: tile_id.zoom_level,
+                        x: tile_id.x * 4 + i as u32,
+                        y: tile_id.y * 4 + y as u32 / tile_cache::TILE_WIDTH as u32,
+                    };
+                    println!("Saving {:?} in cache", tile_id);
+                    *g = Some(td.try_lock_data().expect(
+                        "Tile descriptor was supposed to be empty, data shouldn't be locked",
+                    ));
+                    td.set_id(tile_id);
+                }
+            }
+        }
+    }
+
+    fn process_data(&mut self, data: &[u8]) {
+        self.png.process_data::<()>(data, |palette, event| {
+            match event {
+                inflater::Event::ImageHeader(header) => {
+                    println!("{:?}", header);
+                    Self::update_tiles(
+                        self.cache,
+                        &mut self.current_row_tiles,
+                        self.tile_id,
+                        self.y,
+                    );
+                }
+                inflater::Event::ImageData(pixels) => {
+                    for &index in pixels {
+                        let rgb = palette.color_at(index);
+                        let value =
+                            Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3).into_storage();
+
+                        let tile_x = self.x % tile_cache::TILE_WIDTH;
+                        let tile_y = self.y % tile_cache::TILE_WIDTH;
+
+                        if self.x != BIG_TILE_WIDTH {
+                            if let Some(data) =
+                                &mut self.current_row_tiles[self.x / tile_cache::TILE_WIDTH]
+                            {
+                                let offset =
+                                    (tile_y * tile_cache::TILE_WIDTH + tile_x) * BYTES_PER_PIXEL;
+                                data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+                            }
+                        }
+
+                        self.x += 1;
+                        if self.x == BIG_TILE_WIDTH + 1 {
+                            self.x = 0;
+                            self.y += 1;
+                            if self.y % tile_cache::TILE_WIDTH == 0 && self.y < BIG_TILE_WIDTH {
+                                Self::update_tiles(
+                                    self.cache,
+                                    &mut self.current_row_tiles,
+                                    self.tile_id,
+                                    self.y,
+                                );
+                            }
+                        }
+                    }
+                }
+                inflater::Event::End => {}
+            }
+            ControlFlow::Continue(())
+        });
     }
 }
 
@@ -369,7 +635,7 @@ async fn task(
 struct PngReader {
     dechunker: Dechunker,
     sd: StreamDecoder,
-    inflater: Inflater<16384>,
+    inflater: Inflater<1024>,
 }
 
 impl PngReader {
@@ -381,24 +647,18 @@ impl PngReader {
         }
     }
 
-    async fn process_data<B, R>(
+    fn process_data<B>(
         &mut self,
         mut input: &[u8],
-        mut block: impl FnMut(inflater::Event) -> R,
-    ) -> ControlFlow<B>
-    where
-        R: Future<Output = ControlFlow<B>>,
-    {
+        mut block: impl FnMut(&Palette, inflater::Event) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
         while !input.is_empty() {
-            let (consumed, mut dc_event) = self
-                .dechunker
-                .update(&input[..core::cmp::min(1024000, input.len())])
-                .unwrap();
+            let (consumed, mut dc_event) = self.dechunker.update(&input).unwrap();
 
             while let Some(e) = dc_event {
                 let (leftover, mut sd_event) = self.sd.update(e).unwrap();
                 match sd_event {
-                    None => println!("None"),
+                    None => {}
                     Some(Event::ImageHeader(_)) => println!("ImageHeader"),
                     Some(Event::ImageData(buf)) => println!("ImageData({})", buf.len()),
                     Some(Event::End) => println!("End"),
@@ -408,7 +668,7 @@ impl PngReader {
                     let (leftover, i_event) = self.inflater.update(e).unwrap();
 
                     if let Some(e) = i_event {
-                        block(e).await?;
+                        block(self.sd.palette(), e)?;
                     }
 
                     sd_event = leftover;
@@ -456,4 +716,94 @@ async fn connection_wifi(mut controller: WifiController<'static>) {
 #[embassy_executor::task]
 async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
     stack.run().await
+}
+
+mod tile_cache {
+    use core::{marker::PhantomData, sync::atomic::AtomicBool};
+
+    use spin::mutex::{SpinMutex, SpinMutexGuard};
+
+    pub const BYTES_PER_PIXEL: usize = 2;
+    pub const TILE_WIDTH: usize = 64;
+    pub const TILE_SIZE_BYTES: usize = TILE_WIDTH * TILE_WIDTH * BYTES_PER_PIXEL;
+
+    pub type TileData = [u8; TILE_SIZE_BYTES];
+
+    pub const fn empty<const N: usize>() -> [TileData; N] {
+        [[0u8; TILE_SIZE_BYTES]; N]
+    }
+
+    /// Tile addressing - based on <https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames>, but
+    /// slightly modified.
+    ///
+    /// Zoom level is as in the original scheme. However, x and y a are 2 bits larger, since every
+    /// standard tile contains 16 mini tiles.
+    ///
+    /// In the original scheme coordinates have max 18 bits. In our scheme - 20 bits.
+    /// We could use a more efficient representation (48 bits are enough).
+    #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+    pub struct TileId {
+        pub zoom_level: u8,
+        pub x: u32,
+        pub y: u32,
+    }
+
+    pub struct TileDescriptor<'d> {
+        /// Only lock for very short critical sections (to copy the id)
+        id: SpinMutex<Option<TileId>>,
+        /// Can lock for longer, but always use `try_lock`
+        data: SpinMutex<&'d mut TileData>,
+    }
+
+    impl<'d> TileDescriptor<'d> {
+        pub const fn new(data: &'d mut TileData) -> Self {
+            Self {
+                id: SpinMutex::new(None),
+                data: SpinMutex::new(data),
+            }
+        }
+
+        /// Note: acquires the ID spinlock
+        pub fn get_id(&self) -> Option<TileId> {
+            *self.id.lock()
+        }
+
+        /// Note: acquires the ID spinlock
+        pub fn set_id(&self, id: TileId) {
+            *self.id.lock() = Some(id);
+        }
+
+        pub fn try_lock_data(&'d self) -> Option<TileDataGuard<'d>> {
+            self.data.try_lock()
+        }
+    }
+
+    pub type TileDataGuard<'d> = SpinMutexGuard<'d, &'d mut TileData>;
+
+    pub struct TileCache<'d> {
+        descriptors: &'d [TileDescriptor<'d>],
+    }
+
+    impl<'d> TileCache<'d> {
+        pub const fn new(ds: &'d [TileDescriptor<'d>]) -> Self {
+            Self { descriptors: ds }
+        }
+
+        pub fn lookup(&self, id: TileId) -> Option<&TileDescriptor<'d>> {
+            self.descriptors
+                .as_ref()
+                .iter()
+                .find(|&d| d.get_id() == Some(id))
+        }
+
+        /// Returns any empty tile descriptor.
+        ///
+        /// (In the future we'll return not only empty ones, it will be an eviction policy)
+        pub fn find_empty(&self) -> Option<&TileDescriptor<'d>> {
+            self.descriptors
+                .as_ref()
+                .iter()
+                .find(|&d| d.get_id().is_none())
+        }
+    }
 }

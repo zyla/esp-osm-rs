@@ -680,6 +680,7 @@ dependencies = [
  "mipidsi",
  "reqwless",
  "smoltcp",
+ "spin",
  "static_cell",
  "xpt2046",
 ]
@@ -1069,7 +1070,6 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 [[package]]
 name = "incremental-png"
 version = "0.1.0"
-source = "git+https://github.com/zyla/incremental-png?rev=e05eaf91f8fd8d10f0dca7ba461c6190520c4f94#e05eaf91f8fd8d10f0dca7ba461c6190520c4f94"
 dependencies = [
  "heapless",
  "miniz_oxide",
