@@ -3,12 +3,17 @@
 #![feature(type_alias_impl_trait)]
 #![feature(iter_collect_into)]
 #![feature(async_closure)]
+#![feature(const_mut_refs)]
+#![feature(generic_arg_infer)]
 #![allow(clippy::upper_case_acronyms)]
+#![allow(non_camel_case_types)]
 #![allow(unused)]
 extern crate alloc;
 use crate::hal::dma::DmaPriority;
 use crate::hal::pdma::Dma;
 use crate::hal::pdma::Spi2DmaChannelCreator;
+use crate::tile_cache::TileDescriptor;
+use crate::tile_cache::TileId;
 use core::future::Future;
 use core::{alloc::GlobalAlloc, ops::ControlFlow, str};
 use embassy_net::{
@@ -132,6 +137,8 @@ mod display {
 }
 
 use display::DISPLAY;
+use tile_cache::TileCache;
+use tile_cache::TileDataGuard;
 
 #[embassy_macros::main_riscv(entry = "hal::entry")]
 async fn main(spawner: embassy_executor::Spawner) {
@@ -270,6 +277,8 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     let delay = Delay::new(&clocks);
 
+    let tile_cache = make_static!(init_tile_cache());
+
     //   spawner.spawn(connection_wifi(controller)).ok();
     //   spawner.spawn(net_task(stack)).ok();
     spawner
@@ -281,8 +290,26 @@ async fn main(spawner: embassy_executor::Spawner) {
             delay,
             rtc,
             dma.spi2channel,
+            tile_cache,
         ))
         .ok();
+}
+
+static mut TILES_1: [tile_cache::TileData; 9] = tile_cache::empty();
+#[link_section = ".dram2_uninit"]
+static mut TILES_2: [tile_cache::TileData; 11] = tile_cache::empty();
+
+type TILE_CACHE = TileCache<'static>;
+
+fn init_tile_cache() -> TILE_CACHE {
+    let descriptors: &mut heapless::Vec<tile_cache::TileDescriptor<'static>, { 9 + 11 }> =
+        make_static!(heapless::Vec::from_iter(
+            unsafe { &mut TILES_1 }
+                .iter_mut()
+                .chain(unsafe { &mut TILES_2 }.iter_mut())
+                .map(TileDescriptor::new)
+        ));
+    TileCache::new(descriptors.as_slice())
 }
 
 #[embassy_executor::task]
@@ -294,52 +321,30 @@ async fn task(
     mut delay: Delay,
     rtc: Rtc<'static>,
     dma_channel: Spi2DmaChannelCreator,
+    tile_cache: &'static TILE_CACHE,
 ) {
     let png_bytes = include_bytes!("../test-tile.png");
 
     println!("num png bytes: {}", png_bytes.len());
     let start = rtc.get_time_us();
     const MINI_TILE_SIZE: usize = 64 * 64 * 2;
-    static mut PIXEL_BUFFER_1: heapless::Vec<u8, { MINI_TILE_SIZE * 9 }> = heapless::Vec::new();
+    static mut PIXEL_BUFFER_1: heapless::Vec<u8, 0> = heapless::Vec::new();
     #[link_section = ".dram2_uninit"]
-    static mut PIXEL_BUFFER_2: [u8; MINI_TILE_SIZE * 11] = [0; MINI_TILE_SIZE * 11];
+    static mut PIXEL_BUFFER_2: [u8; 0] = [];
 
     let pixel_buffer_1 = unsafe { &mut PIXEL_BUFFER_1 };
     let pixel_buffer_2 = unsafe { &mut PIXEL_BUFFER_2 };
     let mut pixel_buffer_2_index: usize = 0;
 
-    let mut png = PngReader::new();
-
-    png.process_data::<()>(png_bytes, |palette, event| {
-        match event {
-            inflater::Event::ImageHeader(header) => println!("{:?}", header),
-            inflater::Event::ImageData(pixels) => {
-                let iter = pixels.iter().flat_map(|&index| {
-                    let rgb = palette.color_at(index);
-                    let u = Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3)
-                        .into_storage()
-                        .to_be_bytes();
-                    u
-                });
-                let first = iter
-                    .clone()
-                    .take(pixel_buffer_1.capacity() - pixel_buffer_1.len());
-                let second = iter
-                    .clone()
-                    .skip(pixel_buffer_1.capacity() - pixel_buffer_1.len())
-                    .take(pixel_buffer_2.len() - pixel_buffer_2_index);
-
-                pixel_buffer_1.extend(first);
-
-                for b in second {
-                    pixel_buffer_2[pixel_buffer_2_index] = b;
-                    pixel_buffer_2_index += 1;
-                }
-            }
-            inflater::Event::End => {}
-        }
-        ControlFlow::Continue(())
-    });
+    let mut td = TileDecoder::new(
+        tile_cache,
+        BigTileId {
+            zoom_level: 1,
+            x: 0,
+            y: 0,
+        },
+    );
+    td.process_data(png_bytes);
 
     let end = rtc.get_time_us();
     println!("incremental-png decoded in {}us", end - start);
@@ -395,6 +400,114 @@ async fn task(
 
         let end = rtc.get_time_us();
         print!("rendered in {}us\r", end - start);
+    }
+}
+
+/// Standard slippy map tile address - based on <https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames>
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+pub struct BigTileId {
+    pub zoom_level: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
+struct TileDecoder<'a> {
+    cache: &'a TileCache<'a>,
+    tile_id: BigTileId,
+    png: PngReader,
+    current_row_tiles: [Option<TileDataGuard<'a>>; 4],
+    x: usize,
+    y: usize,
+}
+
+const BIG_TILE_WIDTH: usize = 256;
+
+impl<'a> TileDecoder<'a> {
+    fn new(cache: &'a TileCache<'a>, tile_id: BigTileId) -> Self {
+        Self {
+            cache,
+            tile_id,
+            png: PngReader::new(),
+            current_row_tiles: Default::default(),
+            x: 0,
+            y: 0,
+        }
+    }
+
+    fn update_tiles(
+        cache: &'a TileCache<'a>,
+        current_row_tiles: &mut [Option<TileDataGuard<'a>>; 4],
+        tile_id: BigTileId,
+        y: usize,
+    ) {
+        for (i, g) in current_row_tiles.iter_mut().enumerate() {
+            match cache.find_empty() {
+                None => {
+                    // No space in cache, skip the tile
+                    // TODO: evict something
+                    *g = None;
+                }
+                Some(td) => {
+                    let tile_id = TileId {
+                        zoom_level: tile_id.zoom_level,
+                        x: tile_id.x * 4 + i as u32,
+                        y: y as u32 / tile_cache::TILE_WIDTH as u32,
+                    };
+                    *g = Some(td.try_lock_data().expect(
+                        "Tile descriptor was supposed to be empty, data shouldn't be locked",
+                    ));
+                    td.set_id(tile_id);
+                }
+            }
+        }
+    }
+
+    fn process_data(&mut self, data: &[u8]) {
+        self.png.process_data::<()>(data, |palette, event| {
+            match event {
+                inflater::Event::ImageHeader(header) => {
+                    println!("{:?}", header);
+                    Self::update_tiles(
+                        self.cache,
+                        &mut self.current_row_tiles,
+                        self.tile_id,
+                        self.y,
+                    );
+                }
+                inflater::Event::ImageData(pixels) => {
+                    for &index in pixels {
+                        let rgb = palette.color_at(index);
+                        let value =
+                            Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3).into_storage();
+
+                        if let Some(data) =
+                            &mut self.current_row_tiles[self.x / tile_cache::TILE_WIDTH]
+                        {
+                            let tile_x = self.x % tile_cache::TILE_WIDTH;
+                            let tile_y = self.y % tile_cache::TILE_WIDTH;
+                            let offset = tile_y * tile_cache::TILE_WIDTH + tile_x;
+                            data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+                        }
+
+                        self.x += 1;
+                        if self.x == BIG_TILE_WIDTH {
+                            self.x = 0;
+                            self.y += 1;
+                            if self.y % tile_cache::TILE_WIDTH == 0 {
+                                Self::update_tiles(
+                                    self.cache,
+                                    &mut self.current_row_tiles,
+                                    self.tile_id,
+                                    self.y,
+                                );
+                            }
+                        }
+                    }
+                }
+                inflater::Event::End => {}
+            }
+            ControlFlow::Continue(())
+        });
     }
 }
 
@@ -491,10 +604,17 @@ async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
 mod tile_cache {
     use core::{marker::PhantomData, sync::atomic::AtomicBool};
 
-    const BYTES_PER_PIXEL: usize = 2;
-    const TILE_WIDTH: usize = 64;
+    use spin::mutex::{SpinMutex, SpinMutexGuard};
 
-    type TileData = [u8; TILE_WIDTH * TILE_WIDTH * BYTES_PER_PIXEL];
+    pub const BYTES_PER_PIXEL: usize = 2;
+    pub const TILE_WIDTH: usize = 64;
+    pub const TILE_SIZE_BYTES: usize = TILE_WIDTH * TILE_WIDTH * BYTES_PER_PIXEL;
+
+    pub type TileData = [u8; TILE_SIZE_BYTES];
+
+    pub const fn empty<const N: usize>() -> [TileData; N] {
+        [[0u8; TILE_SIZE_BYTES]; N]
+    }
 
     /// Tile addressing - based on <https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames>, but
     /// slightly modified.
@@ -504,37 +624,69 @@ mod tile_cache {
     ///
     /// In the original scheme coordinates have max 18 bits. In our scheme - 20 bits.
     /// We could use a more efficient representation (48 bits are enough).
-    #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
-    struct TileId {
-        zoom_level: u8,
-        x: u32,
-        y: u32,
+    #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+    pub struct TileId {
+        pub zoom_level: u8,
+        pub x: u32,
+        pub y: u32,
     }
 
-    #[derive(Clone, Copy)]
-    pub struct TileDescriptor {
-        id: Option<TileId>,
-        data: *mut TileData,
+    pub struct TileDescriptor<'d> {
+        /// Only lock for very short critical sections (to copy the id)
+        id: SpinMutex<Option<TileId>>,
+        /// Can lock for longer, but always use `try_lock`
+        data: SpinMutex<&'d mut TileData>,
     }
 
-    impl TileDescriptor {
-        pub const fn new(data: *mut TileData) -> Self {
-            Self { id: None, data }
+    impl<'d> TileDescriptor<'d> {
+        pub const fn new(data: &'d mut TileData) -> Self {
+            Self {
+                id: SpinMutex::new(None),
+                data: SpinMutex::new(data),
+            }
+        }
+
+        /// Note: acquires the ID spinlock
+        pub fn get_id(&self) -> Option<TileId> {
+            *self.id.lock()
+        }
+
+        /// Note: acquires the ID spinlock
+        pub fn set_id(&self, id: TileId) {
+            *self.id.lock() = Some(id);
+        }
+
+        pub fn try_lock_data(&'d self) -> Option<TileDataGuard<'d>> {
+            self.data.try_lock()
         }
     }
 
-    pub struct TileGuard<'a> {
-        ptr: *mut TileData,
-        phantom: PhantomData<&'a ()>,
+    pub type TileDataGuard<'d> = SpinMutexGuard<'d, &'d mut TileData>;
+
+    pub struct TileCache<'d> {
+        descriptors: &'d [TileDescriptor<'d>],
     }
 
-    pub struct TileCache<Ds> {
-        descriptors: Ds,
-    }
-
-    impl<Ds: AsMut<[TileDescriptor]>> TileCache<Ds> {
-        pub const fn new(ds: Ds) -> Self {
+    impl<'d> TileCache<'d> {
+        pub const fn new(ds: &'d [TileDescriptor<'d>]) -> Self {
             Self { descriptors: ds }
+        }
+
+        pub fn lookup(&self, id: TileId) -> Option<&TileDescriptor<'d>> {
+            self.descriptors
+                .as_ref()
+                .iter()
+                .find(|&d| d.get_id() == Some(id))
+        }
+
+        /// Returns any empty tile descriptor.
+        ///
+        /// (In the future we'll return not only empty ones, it will be an eviction policy)
+        pub fn find_empty(&self) -> Option<&TileDescriptor<'d>> {
+            self.descriptors
+                .as_ref()
+                .iter()
+                .find(|&d| d.get_id().is_none())
         }
     }
 }
