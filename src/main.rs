@@ -139,6 +139,8 @@ mod display {
 use display::DISPLAY;
 use tile_cache::TileCache;
 use tile_cache::TileDataGuard;
+use tile_cache::BYTES_PER_PIXEL;
+use tile_cache::TILE_WIDTH;
 
 #[embassy_macros::main_riscv(entry = "hal::entry")]
 async fn main(spawner: embassy_executor::Spawner) {
@@ -295,7 +297,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         .ok();
 }
 
-static mut TILES_1: [tile_cache::TileData; 9] = tile_cache::empty();
+static mut TILES_1: [tile_cache::TileData; 8] = tile_cache::empty();
 #[link_section = ".dram2_uninit"]
 static mut TILES_2: [tile_cache::TileData; 11] = tile_cache::empty();
 
@@ -327,21 +329,13 @@ async fn task(
 
     println!("num png bytes: {}", png_bytes.len());
     let start = rtc.get_time_us();
-    const MINI_TILE_SIZE: usize = 64 * 64 * 2;
-    static mut PIXEL_BUFFER_1: heapless::Vec<u8, 0> = heapless::Vec::new();
-    #[link_section = ".dram2_uninit"]
-    static mut PIXEL_BUFFER_2: [u8; 0] = [];
-
-    let pixel_buffer_1 = unsafe { &mut PIXEL_BUFFER_1 };
-    let pixel_buffer_2 = unsafe { &mut PIXEL_BUFFER_2 };
-    let mut pixel_buffer_2_index: usize = 0;
 
     let mut td = TileDecoder::new(
         tile_cache,
         BigTileId {
-            zoom_level: 1,
-            x: 0,
-            y: 0,
+            zoom_level: 18,
+            x: 146372,
+            y: 86317,
         },
     );
     td.process_data(png_bytes);
@@ -350,56 +344,170 @@ async fn task(
     println!("incremental-png decoded in {}us", end - start);
 
     let (di, _, _) = display.release();
-    let (spi, mut dc) = di.release();
+    let (spi, dc) = di.release();
 
     let descriptors = make_static!([0u32; 8 * 3]);
     let rx_descriptors = make_static!([0u32; 8 * 3]);
 
-    let mut spi = FlashSafeDma::<_, 8>::new(spi.with_dma(dma_channel.configure(
+    let spi = FlashSafeDma::<_, 8>::new(spi.with_dma(dma_channel.configure(
         false,
         descriptors,
         rx_descriptors,
         DmaPriority::Priority0,
     )));
 
+    let mut display = Display2::new(spi, dc);
+
+    let mut zoom_level = 0;
+    let mut global_x = 0;
+    let mut global_y = 0;
+
+    zoom_level = 18;
+    global_x = 146372 * 256;
+    global_y = 86317 * 256 + 10;
+
     loop {
         Timer::after(Duration::from_millis(0)).await;
 
         let start = rtc.get_time_us();
 
-        // 1 = data, 0 = command
-        use crate::hal::prelude::_embedded_hal_async_spi_SpiBus as SpiBus;
-        use crate::hal::prelude::_embedded_hal_blocking_spi_Write as Write;
+        let first_tile_x = global_x / TILE_WIDTH;
+        let first_tile_y = global_y / TILE_WIDTH;
 
-        // Set Column Address
-        dc.set_low().unwrap();
-        Write::write(&mut spi, &[0x2A]).unwrap();
-        dc.set_high().unwrap();
-        Write::write(&mut spi, &[0, 0, 1, 0]).unwrap();
+        let mut total = 0;
 
-        // Set Page Address
-        dc.set_low().unwrap();
-        Write::write(&mut spi, &[0x2B]).unwrap();
-        dc.set_high().unwrap();
-        Write::write(&mut spi, &[0, 0, 1, 0]).unwrap();
+        for tile_x in first_tile_x..first_tile_x + DISPLAY_WIDTH / TILE_WIDTH + 1 {
+            for tile_y in first_tile_y..first_tile_y + DISPLAY_HEIGHT / TILE_WIDTH + 1 {
+                let tile_id = TileId {
+                    zoom_level,
+                    x: tile_x as u32,
+                    y: tile_y as u32,
+                };
 
-        // Write Memory Start
-        dc.set_low().unwrap();
-        Write::write(&mut spi, &[0x2C]).unwrap();
-        dc.set_high().unwrap();
+                let target_x = -((global_x % TILE_WIDTH) as i32)
+                    + ((tile_x - first_tile_x) * TILE_WIDTH) as i32;
+                let target_y = -((global_y % TILE_WIDTH) as i32)
+                    + ((tile_y - first_tile_y) * TILE_WIDTH) as i32;
+                //               println!(
+                //                   "Draw tile ({},{}) at ({}, {})",
+                //                   tile_id.x, tile_id.y, target_x, target_y
+                //               );
 
-        // Simulate drawing "mini-tiles" 64x64
-        for buf in [
-            pixel_buffer_1.as_slice(),
-            &pixel_buffer_2.as_slice()[..256 * 240 * 2 - pixel_buffer_1.len()],
-        ] {
-            for chunk in buf.chunks(64 * 64 * 2) {
-                SpiBus::write(&mut spi, chunk).await.unwrap();
+                if let Some(data) = tile_cache.lookup(tile_id).and_then(|td| td.try_lock_data()) {
+                    display.draw_tile(&rtc, target_x, target_y, *data).await;
+                }
             }
         }
 
         let end = rtc.get_time_us();
         print!("rendered in {}us\r", end - start);
+
+        //        Timer::after_millis(10000).await;
+    }
+}
+
+// A bit smaller until we have PSRAM
+const DISPLAY_WIDTH: usize = 320;
+const DISPLAY_HEIGHT: usize = 240;
+
+struct Display2<SPI, DC> {
+    spi: SPI,
+    dc: DC,
+}
+use crate::hal::prelude::_embedded_hal_async_spi_SpiBus as SpiBus;
+use crate::hal::prelude::_embedded_hal_blocking_spi_Write as SpiWrite;
+
+impl<SPI: SpiBus + SpiWrite<u8>, DC: _embedded_hal_digital_v2_OutputPin> Display2<SPI, DC>
+where
+    <SPI as SpiWrite<u8>>::Error: core::fmt::Debug,
+    <DC as _embedded_hal_digital_v2_OutputPin>::Error: core::fmt::Debug,
+{
+    pub fn new(spi: SPI, dc: DC) -> Self {
+        Self { spi, dc }
+    }
+
+    pub async fn draw_tile(
+        &mut self,
+        rtc: &Rtc<'static>,
+        target_x: i32,
+        target_y: i32,
+        data: &[u8],
+    ) {
+        // Clip the tile if needed
+        let tile_offset_x = -core::cmp::min(target_x, 0);
+        let tile_offset_y = -core::cmp::min(target_y, 0);
+        let width = core::cmp::min(
+            TILE_WIDTH as i32 - tile_offset_x,
+            DISPLAY_WIDTH as i32 - target_x,
+        );
+        let height = core::cmp::min(
+            TILE_WIDTH as i32 - tile_offset_y,
+            DISPLAY_HEIGHT as i32 - target_y,
+        );
+
+        // Clipping in X axis requires more DMA transfers, unfortunately
+        let clipped_x = tile_offset_x > 0 || width < TILE_WIDTH as i32;
+
+        let display_col_start: u16 = core::cmp::max(target_x, 0) as u16;
+        let display_col_end: u16 = display_col_start + width as u16 - 1;
+        let display_row_start: u16 = core::cmp::max(target_y, 0) as u16;
+        let display_row_end: u16 = display_row_start + height as u16 - 1;
+
+        let mut params = [0u8; 4];
+
+        //        println!("Set_Column_Address({display_col_start}, {display_col_end})");
+
+        // Set Column Address
+        self.dc.set_low().unwrap();
+        SpiWrite::write(&mut self.spi, &[0x2A]).unwrap();
+        self.dc.set_high().unwrap();
+        params[0..2].copy_from_slice(&display_col_start.to_be_bytes());
+        params[2..4].copy_from_slice(&display_col_end.to_be_bytes());
+        SpiWrite::write(&mut self.spi, &params).unwrap();
+
+        //       println!("Set_Page_Address({display_row_start}, {display_row_end})");
+
+        // Set Page Address
+        self.dc.set_low().unwrap();
+        SpiWrite::write(&mut self.spi, &[0x2B]).unwrap();
+        self.dc.set_high().unwrap();
+        params[0..2].copy_from_slice(&display_row_start.to_be_bytes());
+        params[2..4].copy_from_slice(&display_row_end.to_be_bytes());
+        SpiWrite::write(&mut self.spi, &params).unwrap();
+
+        // SpiWrite Memory Start
+        self.dc.set_low().unwrap();
+        SpiWrite::write(&mut self.spi, &[0x2C]).unwrap();
+        self.dc.set_high().unwrap();
+
+        //        let start = rtc.get_time_us();
+
+        //      println!("Tile rect: ({tile_offset_x}, {tile_offset_y}, {width}, {height})");
+
+        if !clipped_x {
+            // Easy case: one transfer
+            SpiBus::write(
+                &mut self.spi,
+                &data[tile_offset_y as usize * TILE_WIDTH * BYTES_PER_PIXEL
+                    ..(tile_offset_y + height) as usize * TILE_WIDTH * BYTES_PER_PIXEL],
+            )
+            .await
+            .unwrap();
+        } else {
+            // Transfer each row separately
+
+            for y in tile_offset_y..tile_offset_y + height {
+                let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL;
+                SpiBus::write(
+                    &mut self.spi,
+                    &data[off..off + width as usize * BYTES_PER_PIXEL],
+                )
+                .await
+                .unwrap();
+            }
+        }
+        //       let end = rtc.get_time_us();
+        //       print!("transfer took {}us\n", end - start);
     }
 }
 
@@ -451,8 +559,9 @@ impl<'a> TileDecoder<'a> {
                     let tile_id = TileId {
                         zoom_level: tile_id.zoom_level,
                         x: tile_id.x * 4 + i as u32,
-                        y: y as u32 / tile_cache::TILE_WIDTH as u32,
+                        y: tile_id.y * 4 + y as u32 / tile_cache::TILE_WIDTH as u32,
                     };
+                    println!("Saving {:?} in cache", tile_id);
                     *g = Some(td.try_lock_data().expect(
                         "Tile descriptor was supposed to be empty, data shouldn't be locked",
                     ));
@@ -480,17 +589,21 @@ impl<'a> TileDecoder<'a> {
                         let value =
                             Rgb565::new(rgb[2] >> 3, rgb[1] >> 2, rgb[0] >> 3).into_storage();
 
-                        if let Some(data) =
-                            &mut self.current_row_tiles[self.x / tile_cache::TILE_WIDTH]
-                        {
-                            let tile_x = self.x % tile_cache::TILE_WIDTH;
-                            let tile_y = self.y % tile_cache::TILE_WIDTH;
-                            let offset = tile_y * tile_cache::TILE_WIDTH + tile_x;
-                            data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+                        let tile_x = self.x % tile_cache::TILE_WIDTH;
+                        let tile_y = self.y % tile_cache::TILE_WIDTH;
+
+                        if self.x != BIG_TILE_WIDTH {
+                            if let Some(data) =
+                                &mut self.current_row_tiles[self.x / tile_cache::TILE_WIDTH]
+                            {
+                                let offset =
+                                    (tile_y * tile_cache::TILE_WIDTH + tile_x) * BYTES_PER_PIXEL;
+                                data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+                            }
                         }
 
                         self.x += 1;
-                        if self.x == BIG_TILE_WIDTH {
+                        if self.x == BIG_TILE_WIDTH + 1 {
                             self.x = 0;
                             self.y += 1;
                             if self.y % tile_cache::TILE_WIDTH == 0 {
@@ -533,15 +646,12 @@ impl PngReader {
         mut block: impl FnMut(&Palette, inflater::Event) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         while !input.is_empty() {
-            let (consumed, mut dc_event) = self
-                .dechunker
-                .update(&input[..core::cmp::min(1024000, input.len())])
-                .unwrap();
+            let (consumed, mut dc_event) = self.dechunker.update(&input).unwrap();
 
             while let Some(e) = dc_event {
                 let (leftover, mut sd_event) = self.sd.update(e).unwrap();
                 match sd_event {
-                    None => println!("None"),
+                    None => {}
                     Some(Event::ImageHeader(_)) => println!("ImageHeader"),
                     Some(Event::ImageData(buf)) => println!("ImageData({})", buf.len()),
                     Some(Event::End) => println!("End"),
