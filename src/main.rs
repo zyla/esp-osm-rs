@@ -5,6 +5,7 @@
 #![feature(async_closure)]
 #![feature(const_mut_refs)]
 #![feature(generic_arg_infer)]
+#![feature(cell_update)]
 #![allow(clippy::upper_case_acronyms)]
 #![allow(non_camel_case_types)]
 #![allow(unused)]
@@ -14,6 +15,7 @@ use crate::hal::pdma::Dma;
 use crate::hal::pdma::Spi2DmaChannelCreator;
 use crate::tile_cache::TileDescriptor;
 use crate::tile_cache::TileId;
+use core::cell::Cell;
 use core::future::Future;
 use core::{alloc::GlobalAlloc, ops::ControlFlow, str};
 use embassy_net::{
@@ -24,6 +26,7 @@ use embassy_net::{
 use embassy_time::{Duration, Ticker, Timer};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::IntoStorage;
+use embedded_graphics::prelude::Point;
 use embedded_graphics::{
     pixelcolor::{Gray8, Rgb888},
     prelude::Dimensions,
@@ -43,17 +46,17 @@ pub use esp32c3_hal as hal;
 #[cfg(feature = "esp32c6")]
 pub use esp32c6_hal as hal;
 
+use hal::dma::Channel;
+use hal::pdma::Spi2DmaChannel;
 use hal::spi::SpiBusDevice;
 #[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
 use hal::systimer::SystemTimer;
-use hal::dma::Channel;
-use hal::pdma::Spi2DmaChannel;
 use hal::FlashSafeDma;
 use hal::{
     clock::ClockControl, embassy, gpio::*, peripherals::Peripherals, prelude::*, timer::TimerGroup,
     Rtc, IO,
 };
-use hal::{peripherals,Delay, Rng};
+use hal::{peripherals, Delay, Rng};
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_io_async::Read;
@@ -66,6 +69,7 @@ use mipidsi::dcs::SetColumnAddress;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
 use smoltcp::wire::TcpControl;
+use spin::barrier::BarrierWaitResult;
 use static_cell::make_static;
 
 const SSID: &str = env!("SSID");
@@ -357,10 +361,12 @@ async fn main(spawner: embassy_executor::Spawner) {
     let spi_2 = spi_bus_controller.add_device(fake_cs);
 
     let mut xpt_drv: touch::TOUCH =
-        Xpt2046::new(spi_2, cs, MyIrq(touch_irq), Orientation::PortraitFlipped);
+        Xpt2046::new(spi_2, cs, MyIrq(touch_irq), Orientation::LandscapeFlipped);
     xpt_drv.init(&mut delay).unwrap();
 
-    spawner.spawn(on_touch(xpt_drv)).ok();
+    let touch_state = make_static!(TouchState::new());
+
+    spawner.spawn(on_touch(xpt_drv, touch_state)).ok();
 
     let delay = Delay::new(&clocks);
 
@@ -378,21 +384,53 @@ async fn main(spawner: embassy_executor::Spawner) {
             rtc,
             dma.spi2channel,
             tile_cache,
+            touch_state,
         ))
         .ok();
 }
 
-// todo: finish task impl
-#[embassy_executor::task]
-async fn on_touch(mut xpt: touch::TOUCH) {
-    let mut ticker = Ticker::every(Duration::from_millis(1));
-    loop {
-        xpt.run(&mut ()).unwrap();
-        if xpt.is_touched() {
-            let p = xpt.get_touch_point();
-            println!("{:?}", p);
+struct TouchState {
+    drag_offset: Cell<Point>,
+}
+
+impl TouchState {
+    pub fn new() -> Self {
+        Self {
+            drag_offset: Cell::new(Point::zero()),
         }
-        ticker.next().await;
+    }
+
+    /// Get the current drag offset and zero it.
+    /// The effect is that each call to take_drag_offset returns offset since the last call.
+    pub fn take_drag_offset(&self) -> Point {
+        self.drag_offset.replace(Point::zero())
+    }
+
+    pub fn add_drag_offset(&self, delta: Point) {
+        self.drag_offset.update(|x| x + delta);
+    }
+}
+
+#[embassy_executor::task]
+async fn on_touch(mut xpt: touch::TOUCH, touch_state: &'static TouchState) {
+    loop {
+        xpt.irq.0.wait_for_low().await.unwrap();
+        println!("touched!");
+        let mut ticker = Ticker::every(Duration::from_millis(1));
+        Timer::after_millis(1).await;
+        let mut last_point = xpt.read_touch_point().unwrap();
+        loop {
+            ticker.next().await;
+            let p = xpt.read_touch_point().unwrap();
+            if !xpt.irq.0.is_low().unwrap() {
+                break;
+            }
+            let delta = p - last_point;
+            // Convert between embedded_graphics_core versions. Ugh
+            let delta = Point::new(delta.x, delta.y);
+            touch_state.add_drag_offset(delta);
+            last_point = p;
+        }
     }
 }
 
@@ -423,6 +461,7 @@ async fn task(
     rtc: Rtc<'static>,
     dma_channel: Spi2DmaChannelCreator,
     tile_cache: &'static TILE_CACHE,
+    touch_state: &'static TouchState,
 ) {
     let png_bytes = include_bytes!("../test-tile.png");
 
@@ -459,15 +498,18 @@ async fn task(
     let mut display = Display2::new(spi, dc);
 
     let mut zoom_level = 0;
-    let mut global_x = 0;
-    let mut global_y = 0;
+    let mut global_x: usize = 0;
+    let mut global_y: usize = 0;
 
     zoom_level = 18;
     global_x = 146372 * 256 + 5;
     global_y = 86317 * 256 + 26;
 
     loop {
-        Timer::after(Duration::from_millis(0)).await;
+        // React to drag events
+        let drag_offset = touch_state.take_drag_offset();
+        global_x = (global_x as i32 - drag_offset.x) as usize;
+        global_y = (global_y as i32 - drag_offset.y) as usize;
 
         let start = rtc.get_time_us();
 
@@ -500,9 +542,7 @@ async fn task(
         }
 
         let end = rtc.get_time_us();
-        print!("rendered in {}us\r", end - start);
-
-        //        Timer::after_millis(10000).await;
+        print!("rendered in {}us\n", end - start);
     }
 }
 
