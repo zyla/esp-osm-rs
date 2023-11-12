@@ -434,9 +434,9 @@ async fn on_touch(mut xpt: touch::TOUCH, touch_state: &'static TouchState) {
     }
 }
 
-static mut TILES_1: [tile_cache::TileData; 8] = tile_cache::empty();
+static mut TILES_1: [tile_cache::TileData; 7] = tile_cache::empty();
 #[link_section = ".dram2_uninit"]
-static mut TILES_2: [tile_cache::TileData; 11] = tile_cache::empty();
+static mut TILES_2: [tile_cache::TileData; 8] = tile_cache::empty();
 
 type TILE_CACHE = TileCache<'static>;
 
@@ -502,8 +502,8 @@ async fn task(
     let mut global_y: usize = 0;
 
     zoom_level = 18;
-    global_x = 146372 * 256 + 5;
-    global_y = 86317 * 256 + 26;
+    global_x = 146372 * 256 - 10;
+    global_y = 86317 * 256;
 
     loop {
         // React to drag events
@@ -536,18 +536,25 @@ async fn task(
                 //               );
 
                 if let Some(data) = tile_cache.lookup(tile_id).and_then(|td| td.try_lock_data()) {
-                    display.draw_tile(&rtc, target_x, target_y, *data).await;
+                    // Note: can't deduplicate, lifetime problems
+                    display
+                        .draw_tile(&rtc, target_x, target_y, Some(*data))
+                        .await;
+                } else {
+                    display.draw_tile(&rtc, target_x, target_y, None).await;
                 }
             }
         }
 
         let end = rtc.get_time_us();
         print!("rendered in {}us\n", end - start);
+
+        //        input.wait_for_rising_edge().await;
     }
 }
 
 // A bit smaller until we have PSRAM
-const DISPLAY_WIDTH: usize = 320;
+const DISPLAY_WIDTH: usize = 256;
 const DISPLAY_HEIGHT: usize = 240;
 
 struct Display2<SPI, DC> {
@@ -571,7 +578,7 @@ where
         rtc: &Rtc<'static>,
         target_x: i32,
         target_y: i32,
-        data: &[u8],
+        data: Option<&[u8]>,
     ) {
         // Clip the tile if needed
         let tile_offset_x = -core::cmp::min(target_x, 0);
@@ -595,8 +602,6 @@ where
 
         let mut params = [0u8; 4];
 
-        //        println!("Set_Column_Address({display_col_start}, {display_col_end})");
-
         // Set Column Address
         self.dc.set_low().unwrap();
         SpiWrite::write(&mut self.spi, &[0x2A]).unwrap();
@@ -604,8 +609,6 @@ where
         params[0..2].copy_from_slice(&display_col_start.to_be_bytes());
         params[2..4].copy_from_slice(&display_col_end.to_be_bytes());
         SpiWrite::write(&mut self.spi, &params).unwrap();
-
-        //       println!("Set_Page_Address({display_row_start}, {display_row_end})");
 
         // Set Page Address
         self.dc.set_low().unwrap();
@@ -622,35 +625,51 @@ where
 
         //        let start = rtc.get_time_us();
 
-        //      println!("Tile rect: ({tile_offset_x}, {tile_offset_y}, {width}, {height})");
-
-        if !clipped_x {
-            // Easy case: one transfer
-            SpiBus::write(
-                &mut self.spi,
-                &data[tile_offset_y as usize * TILE_WIDTH * BYTES_PER_PIXEL
-                    ..(tile_offset_y + height) as usize * TILE_WIDTH * BYTES_PER_PIXEL],
-            )
-            .await
-            .unwrap();
-        } else {
-            // Transfer each row separately
-
-            for y in tile_offset_y..tile_offset_y + height {
-                let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL
-                    + tile_offset_x as usize * BYTES_PER_PIXEL;
+        if let Some(data) = data {
+            if !clipped_x {
+                // Easy case: one transfer
                 SpiBus::write(
                     &mut self.spi,
-                    &data[off..off + width as usize * BYTES_PER_PIXEL],
+                    &data[tile_offset_y as usize * TILE_WIDTH * BYTES_PER_PIXEL
+                        ..(tile_offset_y + height) as usize * TILE_WIDTH * BYTES_PER_PIXEL],
                 )
                 .await
                 .unwrap();
+            } else {
+                // Transfer each row separately
+
+                for y in tile_offset_y..tile_offset_y + height {
+                    let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL
+                        + tile_offset_x as usize * BYTES_PER_PIXEL;
+                    SpiBus::write(
+                        &mut self.spi,
+                        &data[off..off + width as usize * BYTES_PER_PIXEL],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        } else {
+            // Drawing an empty tile
+            //          println!("tile is empty");
+
+            //          println!("Set_Column_Address({display_col_start}, {display_col_end})");
+            //          println!("Set_Page_Address({display_row_start}, {display_row_end})");
+            //          println!("Tile rect: ({tile_offset_x}, {tile_offset_y}, {width}, {height})");
+            let mut num_bytes = (width * height) as usize * BYTES_PER_PIXEL;
+            while num_bytes > 0 {
+                let n = core::cmp::min(num_bytes, ZEROS.len());
+                SpiBus::write(&mut self.spi, &ZEROS[..n]).await.unwrap();
+                num_bytes -= n;
             }
         }
         //       let end = rtc.get_time_us();
         //       print!("transfer took {}us\n", end - start);
     }
 }
+
+#[link_section = ".bss"]
+static ZEROS: [u8; 256] = [0; _];
 
 /// Standard slippy map tile address - based on <https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames>
 #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
