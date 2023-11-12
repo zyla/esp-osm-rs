@@ -363,7 +363,7 @@ async fn task(
     let mut global_y = 0;
 
     zoom_level = 18;
-    global_x = 146372 * 256;
+    global_x = 146372 * 256 + 5;
     global_y = 86317 * 256 + 10;
 
     loop {
@@ -497,7 +497,8 @@ where
             // Transfer each row separately
 
             for y in tile_offset_y..tile_offset_y + height {
-                let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL;
+                let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL
+                    + tile_offset_x as usize * BYTES_PER_PIXEL;
                 SpiBus::write(
                     &mut self.spi,
                     &data[off..off + width as usize * BYTES_PER_PIXEL],
