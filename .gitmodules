@@ -4,3 +4,6 @@
 [submodule "libs/esp-hal"]
 	path = libs/esp-hal
 	url = https://github.com/zyla/esp-hal
+[submodule "libs/incremental-png"]
+	path = libs/incremental-png
+	url = https://github.com/zyla/incremental-png.git

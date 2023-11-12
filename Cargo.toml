@@ -48,8 +48,7 @@ esp32-hal = { version = "0.15.0", features=["embassy","async","embassy-time-timg
 display-interface = { version = "0.4.1" }
 display-interface-spi = "0.4.1"
 
-#incremental-png = { git = "https://github.com/zyla/incremental-png", rev = "e05eaf91f8fd8d10f0dca7ba461c6190520c4f94" }
-incremental-png = { path = "../incremental-png" }
+incremental-png = { path = "./libs/incremental-png" }
 
 embedded-io-async = "0.6.0"
 mipidsi = { version = "0.7.1" }
