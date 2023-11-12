@@ -274,7 +274,7 @@ dependencies = [
  "as-slice 0.2.1",
  "atomic-pool",
  "embassy-net-driver",
- "embassy-sync 0.3.0 (git+https://github.com/zyla/embassy?rev=4e27208fca46)",
+ "embassy-sync 0.3.0",
  "embassy-time 0.1.4",
  "embedded-io-async 0.6.0",
  "embedded-nal-async",
@@ -301,18 +301,6 @@ dependencies = [
  "cfg-if",
  "critical-section",
  "embedded-io 0.4.0",
- "futures-util",
- "heapless",
-]
-
-[[package]]
-name = "embassy-sync"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0525b466ca3ace30b57f2db868a35215dfaecd038d8668cb2db03feb7c069a0"
-dependencies = [
- "cfg-if",
- "critical-section",
  "futures-util",
  "heapless",
 ]
@@ -606,7 +594,6 @@ dependencies = [
  "bitflags 2.4.1",
  "cfg-if",
  "critical-section",
- "embassy-executor",
  "embassy-futures",
  "embassy-sync 0.2.0",
  "embassy-time 0.1.5",
@@ -732,7 +719,7 @@ dependencies = [
  "critical-section",
  "embassy-futures",
  "embassy-net-driver",
- "embassy-sync 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "embassy-sync 0.3.0",
  "embedded-io 0.4.0",
  "embedded-svc",
  "enumset",

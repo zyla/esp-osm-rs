@@ -13,7 +13,7 @@ use embassy_net::{
     tcp::client::{TcpClient, TcpClientState},
     Config, Stack, StackResources,
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Ticker, Timer};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::IntoStorage;
 use embedded_graphics::{
@@ -36,11 +36,11 @@ pub use esp32c6_hal as hal;
 use hal::spi::SpiBusDevice;
 #[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
 use hal::systimer::SystemTimer;
-use hal::{Rng, peripherals};
 use hal::{
     clock::ClockControl, embassy, gpio::*, peripherals::Peripherals, prelude::*, timer::TimerGroup,
     Rtc, IO,
 };
+use hal::{peripherals, Rng};
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_io_async::Read;
@@ -127,29 +127,38 @@ mod display {
 
 use display::DISPLAY;
 
-
 mod touch {
     use super::*;
+    use crate::hal::spi::FullDuplexMode;
+    use crate::peripherals::SPI3;
+
+    pub type CS = GpioPin<Output<PushPull>, 33>;
+    pub type FAKE_CS = GpioPin<Output<PushPull>, 22>;
+    pub type TOUCH =
+        Xpt2046<SpiBusDevice<'static, 'static, SPI3, FAKE_CS, FullDuplexMode>, CS, MyIrq>;
 
     pub struct MyIrq(pub TP_IRQ);
 
+    impl MyIrq {
+        pub fn new(pin: TP_IRQ) {}
+    }
+
     impl xpt2046::Xpt2046Exti for MyIrq {
         type Exti = ();
+
         fn clear_interrupt(&mut self) {
             self.0.clear_interrupt()
         }
         fn disable_interrupt(&mut self, exti: &mut Self::Exti) {
-            hal::interrupt::disable(
-                hal::get_core(),
-                hal::peripherals::Interrupt::GPIO
-            )
+            hal::interrupt::disable(hal::get_core(), hal::peripherals::Interrupt::GPIO)
         }
 
         fn enable_interrupt(&mut self, exti: &mut Self::Exti) {
             hal::interrupt::enable(
                 hal::peripherals::Interrupt::GPIO,
                 hal::interrupt::Priority::Priority1,
-            ).unwrap()
+            )
+            .unwrap()
         }
 
         fn is_high(&self) -> bool {
@@ -292,12 +301,11 @@ async fn main(spawner: embassy_executor::Spawner) {
     display.clear(display::BACKGROUND).unwrap();
     display::flush(&mut display).unwrap();
 
-
-    use hal::{spi::SpiMode, Delay, Spi};
-    use xpt2046::{Xpt2046, Orientation};
     use hal::spi::SpiBusController;
-    
-    let mut touch_irq = io.pins.gpio36.into_pull_up_input();
+    use hal::{spi::SpiMode, Delay, Spi};
+    use xpt2046::{Orientation, Xpt2046};
+
+    let touch_irq = io.pins.gpio36.into_pull_up_input();
 
     // Define the SPI pins and create the SPI interface
     let sck = io.pins.gpio25;
@@ -316,25 +324,18 @@ async fn main(spawner: embassy_executor::Spawner) {
         &clocks,
     );
 
-        
     let mut delay = Delay::new(&clocks);
 
-    let spi_bus_controller  = SpiBusController::from_spi(spi);
+    let spi_bus_controller = make_static!(SpiBusController::from_spi(spi));
 
-    let spi_2 = spi_bus_controller.add_device(fake_cs);        
+    let spi_2 = spi_bus_controller.add_device(fake_cs);
 
-    let mut xpt_drv: Xpt2046<_, GpioPin<Output<PushPull>, 32>, MyIrq> = Xpt2046::new(
-        spi_2,
-        cs,
-        MyIrq(touch_irq),
-        Orientation::PortraitFlipped,
-    );
+    let mut xpt_drv: touch::TOUCH =
+        Xpt2046::new(spi_2, cs, MyIrq(touch_irq), Orientation::PortraitFlipped);
     xpt_drv.init(&mut delay).unwrap();
 
-    
+    spawner.spawn(on_touch(xpt_drv)).ok();
 
-//   spawner.spawn(on_touch(touch_irq, xpt_drv)).ok();
-    
     //   spawner.spawn(connection_wifi(controller)).ok();
     //   spawner.spawn(net_task(stack)).ok();
     spawner
@@ -343,13 +344,18 @@ async fn main(spawner: embassy_executor::Spawner) {
 }
 
 // todo: finish task impl
-// #[embassy_executor::task]
-// async fn on_touch(
-//     mut input: TP_IRQ,
-//     mut xpt_drv: Xpt2046<SpiBusDevice, GpioPin<Output<PushPull>, 32>, TP_IRQ>
-// ) {
-//     xpt_drv
-// }
+#[embassy_executor::task]
+async fn on_touch(mut xpt: touch::TOUCH) {
+    let mut ticker = Ticker::every(Duration::from_millis(1));
+    loop {
+        xpt.run(&mut ()).unwrap();
+        if xpt.is_touched() {
+            let p = xpt.get_touch_point();
+            println!("{:?}", p);
+        }
+        ticker.next().await;
+    }
+}
 
 #[embassy_executor::task]
 async fn task(
