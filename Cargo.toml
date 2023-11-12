@@ -11,6 +11,7 @@ embassy-net = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
 embassy-net-driver = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46"}
 embassy-time = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
 embassy-macros = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
+embassy-sync = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
 
 esp-hal-common = { path = "./libs/esp-hal/esp-hal-common" }
 esp32-hal = { path = "./libs/esp-hal/esp32-hal" }
@@ -42,7 +43,7 @@ embedded-text = "0.6.6"
 # chips
 esp32c3-hal = { version = "0.12.0", features=["embassy","async","embassy-time-timg0"], optional = true }
 esp32c6-hal = { version = "0.5.0", features=["embassy","async","embassy-time-timg0"], optional = true }
-esp32-hal = { version = "0.15.0", features=["embassy","async","embassy-time-timg0", "log"], optional = true }
+esp32-hal = { version = "0.15.0", features=["embassy","async","embassy-time-timg0","eh1","log"], optional = true }
 
 display-interface = { version = "0.4.1" }
 display-interface-spi = "0.4.1"
@@ -53,6 +54,7 @@ embedded-io-async = "0.6.0"
 mipidsi = { version = "0.7.1" }
 xpt2046 = { version = "0.3.1", path = "libs/xpt2046" }
 minipng = "0.1.1"
+embedded-hal-1 = { version = "=1.0.0-rc.1", package = "embedded-hal" }
 spin = "0.9.8"
 
 [features]

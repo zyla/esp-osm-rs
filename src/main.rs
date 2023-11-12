@@ -5,6 +5,7 @@
 #![feature(async_closure)]
 #![feature(const_mut_refs)]
 #![feature(generic_arg_infer)]
+#![feature(cell_update)]
 #![allow(clippy::upper_case_acronyms)]
 #![allow(non_camel_case_types)]
 #![allow(unused)]
@@ -14,6 +15,7 @@ use crate::hal::pdma::Dma;
 use crate::hal::pdma::Spi2DmaChannelCreator;
 use crate::tile_cache::TileDescriptor;
 use crate::tile_cache::TileId;
+use core::cell::Cell;
 use core::future::Future;
 use core::{alloc::GlobalAlloc, ops::ControlFlow, str};
 use embassy_net::{
@@ -21,9 +23,10 @@ use embassy_net::{
     tcp::client::{TcpClient, TcpClientState},
     Config, Stack, StackResources,
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Ticker, Timer};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::IntoStorage;
+use embedded_graphics::prelude::Point;
 use embedded_graphics::{
     pixelcolor::{Gray8, Rgb888},
     prelude::Dimensions,
@@ -45,6 +48,7 @@ pub use esp32c6_hal as hal;
 
 use hal::dma::Channel;
 use hal::pdma::Spi2DmaChannel;
+use hal::spi::SpiBusDevice;
 #[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
 use hal::systimer::SystemTimer;
 use hal::FlashSafeDma;
@@ -52,7 +56,7 @@ use hal::{
     clock::ClockControl, embassy, gpio::*, peripherals::Peripherals, prelude::*, timer::TimerGroup,
     Rtc, IO,
 };
-use hal::{Delay, Rng};
+use hal::{peripherals, Delay, Rng};
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_io_async::Read;
@@ -65,6 +69,7 @@ use mipidsi::dcs::SetColumnAddress;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
 use smoltcp::wire::TcpControl;
+use spin::barrier::BarrierWaitResult;
 use static_cell::make_static;
 
 const SSID: &str = env!("SSID");
@@ -98,6 +103,8 @@ unsafe impl GlobalAlloc for FakeAllocator {
 type BUTTON = Gpio9<Input<PullUp>>;
 #[cfg(feature = "esp32")]
 type BUTTON = Gpio0<Input<PullUp>>;
+
+type TP_IRQ = Gpio36<Input<PullUp>>;
 
 mod display {
     use super::*;
@@ -141,6 +148,53 @@ use tile_cache::TileCache;
 use tile_cache::TileDataGuard;
 use tile_cache::BYTES_PER_PIXEL;
 use tile_cache::TILE_WIDTH;
+
+mod touch {
+    use super::*;
+    use crate::hal::spi::FullDuplexMode;
+    use crate::peripherals::SPI3;
+
+    pub type CS = GpioPin<Output<PushPull>, 33>;
+    pub type FAKE_CS = GpioPin<Output<PushPull>, 22>;
+    pub type TOUCH =
+        Xpt2046<SpiBusDevice<'static, 'static, SPI3, FAKE_CS, FullDuplexMode>, CS, MyIrq>;
+
+    pub struct MyIrq(pub TP_IRQ);
+
+    impl MyIrq {
+        pub fn new(pin: TP_IRQ) {}
+    }
+
+    impl xpt2046::Xpt2046Exti for MyIrq {
+        type Exti = ();
+
+        fn clear_interrupt(&mut self) {
+            self.0.clear_interrupt()
+        }
+        fn disable_interrupt(&mut self, exti: &mut Self::Exti) {
+            hal::interrupt::disable(hal::get_core(), hal::peripherals::Interrupt::GPIO)
+        }
+
+        fn enable_interrupt(&mut self, exti: &mut Self::Exti) {
+            hal::interrupt::enable(
+                hal::peripherals::Interrupt::GPIO,
+                hal::interrupt::Priority::Priority1,
+            )
+            .unwrap()
+        }
+
+        fn is_high(&self) -> bool {
+            self.0.is_high().unwrap()
+        }
+
+        fn is_low(&self) -> bool {
+            self.0.is_low().unwrap()
+        }
+    }
+}
+
+use touch::MyIrq;
+use xpt2046::Xpt2046;
 
 #[embassy_macros::main_riscv(entry = "hal::entry")]
 async fn main(spawner: embassy_executor::Spawner) {
@@ -277,6 +331,43 @@ async fn main(spawner: embassy_executor::Spawner) {
     display.clear(display::BACKGROUND).unwrap();
     display::flush(&mut display).unwrap();
 
+    use hal::spi::SpiBusController;
+    use hal::{spi::SpiMode, Delay, Spi};
+    use xpt2046::{Orientation, Xpt2046};
+
+    let touch_irq = io.pins.gpio36.into_pull_up_input();
+
+    // Define the SPI pins and create the SPI interface
+    let sck = io.pins.gpio25;
+    let miso = io.pins.gpio39;
+    let mosi = io.pins.gpio32;
+    let cs = io.pins.gpio33.into_push_pull_output();
+    let fake_cs = io.pins.gpio22.into_push_pull_output();
+    let spi = Spi::new_no_cs(
+        peripherals.SPI3,
+        sck,
+        mosi,
+        miso,
+        2_u32.MHz(),
+        SpiMode::Mode3,
+        &mut system.peripheral_clock_control,
+        &clocks,
+    );
+
+    let mut delay = Delay::new(&clocks);
+
+    let spi_bus_controller = make_static!(SpiBusController::from_spi(spi));
+
+    let spi_2 = spi_bus_controller.add_device(fake_cs);
+
+    let mut xpt_drv: touch::TOUCH =
+        Xpt2046::new(spi_2, cs, MyIrq(touch_irq), Orientation::LandscapeFlipped);
+    xpt_drv.init(&mut delay).unwrap();
+
+    let touch_state = make_static!(TouchState::new());
+
+    spawner.spawn(on_touch(xpt_drv, touch_state)).ok();
+
     let delay = Delay::new(&clocks);
 
     let tile_cache = make_static!(init_tile_cache());
@@ -293,13 +384,59 @@ async fn main(spawner: embassy_executor::Spawner) {
             rtc,
             dma.spi2channel,
             tile_cache,
+            touch_state,
         ))
         .ok();
 }
 
-static mut TILES_1: [tile_cache::TileData; 8] = tile_cache::empty();
+struct TouchState {
+    drag_offset: Cell<Point>,
+}
+
+impl TouchState {
+    pub fn new() -> Self {
+        Self {
+            drag_offset: Cell::new(Point::zero()),
+        }
+    }
+
+    /// Get the current drag offset and zero it.
+    /// The effect is that each call to take_drag_offset returns offset since the last call.
+    pub fn take_drag_offset(&self) -> Point {
+        self.drag_offset.replace(Point::zero())
+    }
+
+    pub fn add_drag_offset(&self, delta: Point) {
+        self.drag_offset.update(|x| x + delta);
+    }
+}
+
+#[embassy_executor::task]
+async fn on_touch(mut xpt: touch::TOUCH, touch_state: &'static TouchState) {
+    loop {
+        xpt.irq.0.wait_for_low().await.unwrap();
+        println!("touched!");
+        let mut ticker = Ticker::every(Duration::from_millis(1));
+        Timer::after_millis(1).await;
+        let mut last_point = xpt.read_touch_point().unwrap();
+        loop {
+            ticker.next().await;
+            let p = xpt.read_touch_point().unwrap();
+            if !xpt.irq.0.is_low().unwrap() {
+                break;
+            }
+            let delta = p - last_point;
+            // Convert between embedded_graphics_core versions. Ugh
+            let delta = Point::new(delta.x, delta.y);
+            touch_state.add_drag_offset(delta);
+            last_point = p;
+        }
+    }
+}
+
+static mut TILES_1: [tile_cache::TileData; 7] = tile_cache::empty();
 #[link_section = ".dram2_uninit"]
-static mut TILES_2: [tile_cache::TileData; 11] = tile_cache::empty();
+static mut TILES_2: [tile_cache::TileData; 8] = tile_cache::empty();
 
 type TILE_CACHE = TileCache<'static>;
 
@@ -324,6 +461,7 @@ async fn task(
     rtc: Rtc<'static>,
     dma_channel: Spi2DmaChannelCreator,
     tile_cache: &'static TILE_CACHE,
+    touch_state: &'static TouchState,
 ) {
     let png_bytes = include_bytes!("../test-tile.png");
 
@@ -360,15 +498,18 @@ async fn task(
     let mut display = Display2::new(spi, dc);
 
     let mut zoom_level = 0;
-    let mut global_x = 0;
-    let mut global_y = 0;
+    let mut global_x: usize = 0;
+    let mut global_y: usize = 0;
 
     zoom_level = 18;
-    global_x = 146372 * 256 + 5;
-    global_y = 86317 * 256 + 26;
+    global_x = 146372 * 256 - 10;
+    global_y = 86317 * 256;
 
     loop {
-        Timer::after(Duration::from_millis(0)).await;
+        // React to drag events
+        let drag_offset = touch_state.take_drag_offset();
+        global_x = (global_x as i32 - drag_offset.x) as usize;
+        global_y = (global_y as i32 - drag_offset.y) as usize;
 
         let start = rtc.get_time_us();
 
@@ -395,20 +536,25 @@ async fn task(
                 //               );
 
                 if let Some(data) = tile_cache.lookup(tile_id).and_then(|td| td.try_lock_data()) {
-                    display.draw_tile(&rtc, target_x, target_y, *data).await;
+                    // Note: can't deduplicate, lifetime problems
+                    display
+                        .draw_tile(&rtc, target_x, target_y, Some(*data))
+                        .await;
+                } else {
+                    display.draw_tile(&rtc, target_x, target_y, None).await;
                 }
             }
         }
 
         let end = rtc.get_time_us();
-        print!("rendered in {}us\r", end - start);
+        print!("rendered in {}us\n", end - start);
 
-        //        Timer::after_millis(10000).await;
+        //        input.wait_for_rising_edge().await;
     }
 }
 
 // A bit smaller until we have PSRAM
-const DISPLAY_WIDTH: usize = 320;
+const DISPLAY_WIDTH: usize = 256;
 const DISPLAY_HEIGHT: usize = 240;
 
 struct Display2<SPI, DC> {
@@ -432,7 +578,7 @@ where
         rtc: &Rtc<'static>,
         target_x: i32,
         target_y: i32,
-        data: &[u8],
+        data: Option<&[u8]>,
     ) {
         // Clip the tile if needed
         let tile_offset_x = -core::cmp::min(target_x, 0);
@@ -456,8 +602,6 @@ where
 
         let mut params = [0u8; 4];
 
-        //        println!("Set_Column_Address({display_col_start}, {display_col_end})");
-
         // Set Column Address
         self.dc.set_low().unwrap();
         SpiWrite::write(&mut self.spi, &[0x2A]).unwrap();
@@ -465,8 +609,6 @@ where
         params[0..2].copy_from_slice(&display_col_start.to_be_bytes());
         params[2..4].copy_from_slice(&display_col_end.to_be_bytes());
         SpiWrite::write(&mut self.spi, &params).unwrap();
-
-        //       println!("Set_Page_Address({display_row_start}, {display_row_end})");
 
         // Set Page Address
         self.dc.set_low().unwrap();
@@ -483,35 +625,51 @@ where
 
         //        let start = rtc.get_time_us();
 
-        //      println!("Tile rect: ({tile_offset_x}, {tile_offset_y}, {width}, {height})");
-
-        if !clipped_x {
-            // Easy case: one transfer
-            SpiBus::write(
-                &mut self.spi,
-                &data[tile_offset_y as usize * TILE_WIDTH * BYTES_PER_PIXEL
-                    ..(tile_offset_y + height) as usize * TILE_WIDTH * BYTES_PER_PIXEL],
-            )
-            .await
-            .unwrap();
-        } else {
-            // Transfer each row separately
-
-            for y in tile_offset_y..tile_offset_y + height {
-                let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL
-                    + tile_offset_x as usize * BYTES_PER_PIXEL;
+        if let Some(data) = data {
+            if !clipped_x {
+                // Easy case: one transfer
                 SpiBus::write(
                     &mut self.spi,
-                    &data[off..off + width as usize * BYTES_PER_PIXEL],
+                    &data[tile_offset_y as usize * TILE_WIDTH * BYTES_PER_PIXEL
+                        ..(tile_offset_y + height) as usize * TILE_WIDTH * BYTES_PER_PIXEL],
                 )
                 .await
                 .unwrap();
+            } else {
+                // Transfer each row separately
+
+                for y in tile_offset_y..tile_offset_y + height {
+                    let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL
+                        + tile_offset_x as usize * BYTES_PER_PIXEL;
+                    SpiBus::write(
+                        &mut self.spi,
+                        &data[off..off + width as usize * BYTES_PER_PIXEL],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        } else {
+            // Drawing an empty tile
+            //          println!("tile is empty");
+
+            //          println!("Set_Column_Address({display_col_start}, {display_col_end})");
+            //          println!("Set_Page_Address({display_row_start}, {display_row_end})");
+            //          println!("Tile rect: ({tile_offset_x}, {tile_offset_y}, {width}, {height})");
+            let mut num_bytes = (width * height) as usize * BYTES_PER_PIXEL;
+            while num_bytes > 0 {
+                let n = core::cmp::min(num_bytes, ZEROS.len());
+                SpiBus::write(&mut self.spi, &ZEROS[..n]).await.unwrap();
+                num_bytes -= n;
             }
         }
         //       let end = rtc.get_time_us();
         //       print!("transfer took {}us\n", end - start);
     }
 }
+
+#[link_section = ".bss"]
+static ZEROS: [u8; 256] = [0; _];
 
 /// Standard slippy map tile address - based on <https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames>
 #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
