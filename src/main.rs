@@ -426,10 +426,15 @@ async fn on_touch(mut xpt: touch::TOUCH, touch_state: &'static TouchState) {
                 break;
             }
             let delta = p - last_point;
-            // Convert between embedded_graphics_core versions. Ugh
-            let delta = Point::new(delta.x, delta.y);
-            touch_state.add_drag_offset(delta);
             last_point = p;
+
+            // Convert between embedded_graphics_core versions. Ugh
+            let delta = Point::new(delta.x, -delta.y);
+            if delta.x.abs() > 10 || delta.y.abs() > 10 {
+                //println!("Ignoring big delta: {} {}", delta.x, delta.y);
+                continue;
+            }
+            touch_state.add_drag_offset(delta);
         }
     }
 }
@@ -502,7 +507,7 @@ async fn task(
     let mut global_y: usize = 0;
 
     zoom_level = 18;
-    global_x = 146372 * 256 - 10;
+    global_x = 146372 * 256;
     global_y = 86317 * 256;
 
     loop {
@@ -547,7 +552,7 @@ async fn task(
         }
 
         let end = rtc.get_time_us();
-        print!("rendered in {}us\n", end - start);
+        print!("rendered in {}us\r", end - start);
 
         //        input.wait_for_rising_edge().await;
     }
@@ -630,6 +635,9 @@ where
 
         //        let start = rtc.get_time_us();
 
+        //       println!("Set_Column_Address({display_col_start}, {display_col_end})");
+        //       println!("Set_Page_Address({display_row_start}, {display_row_end})");
+        //       println!("Tile rect: ({tile_offset_x}, {tile_offset_y}, {width}, {height})");
         if let Some(data) = data {
             if !clipped_x {
                 // Easy case: one transfer
@@ -659,11 +667,6 @@ where
             }
         } else {
             // Drawing an empty tile
-            //          println!("tile is empty");
-
-            //          println!("Set_Column_Address({display_col_start}, {display_col_end})");
-            //          println!("Set_Page_Address({display_row_start}, {display_row_end})");
-            //          println!("Tile rect: ({tile_offset_x}, {tile_offset_y}, {width}, {height})");
             let mut num_bytes = (width * height) as usize * BYTES_PER_PIXEL;
             while num_bytes > 0 {
                 let n = core::cmp::min(num_bytes, ZEROS.len());
