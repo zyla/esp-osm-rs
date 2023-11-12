@@ -439,9 +439,9 @@ async fn on_touch(mut xpt: touch::TOUCH, touch_state: &'static TouchState) {
     }
 }
 
-static mut TILES_1: [tile_cache::TileData; 7] = tile_cache::empty();
+static mut TILES_1: [tile_cache::TileData; 8] = tile_cache::empty();
 #[link_section = ".dram2_uninit"]
-static mut TILES_2: [tile_cache::TileData; 8] = tile_cache::empty();
+static mut TILES_2: [tile_cache::TileData; 11] = tile_cache::empty();
 
 type TILE_CACHE = TileCache<'static>;
 
