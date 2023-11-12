@@ -339,6 +339,7 @@ async fn task(
         },
     );
     td.process_data(png_bytes);
+    td.finish();
 
     let end = rtc.get_time_us();
     println!("incremental-png decoded in {}us", end - start);
@@ -364,7 +365,7 @@ async fn task(
 
     zoom_level = 18;
     global_x = 146372 * 256 + 5;
-    global_y = 86317 * 256 + 10;
+    global_y = 86317 * 256 + 26;
 
     loop {
         Timer::after(Duration::from_millis(0)).await;
@@ -543,6 +544,11 @@ impl<'a> TileDecoder<'a> {
         }
     }
 
+    fn finish(&mut self) {
+        // Unlock tiles
+        self.current_row_tiles = Default::default();
+    }
+
     fn update_tiles(
         cache: &'a TileCache<'a>,
         current_row_tiles: &mut [Option<TileDataGuard<'a>>; 4],
@@ -607,7 +613,7 @@ impl<'a> TileDecoder<'a> {
                         if self.x == BIG_TILE_WIDTH + 1 {
                             self.x = 0;
                             self.y += 1;
-                            if self.y % tile_cache::TILE_WIDTH == 0 {
+                            if self.y % tile_cache::TILE_WIDTH == 0 && self.y < BIG_TILE_WIDTH {
                                 Self::update_tiles(
                                     self.cache,
                                     &mut self.current_row_tiles,
