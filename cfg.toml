@@ -1,4 +1,4 @@
 [esp-wifi]
-heap_size = 16384
+heap_size = 32768
 static_rx_buf_num = 2
 static_tx_buf_num = 1

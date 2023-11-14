@@ -403,12 +403,14 @@ async fn main(spawner: embassy_executor::Spawner) {
 
 struct ViewState {
     tile_needed: Cell<Option<TileId>>,
+    first_visible_tile: Cell<Option<TileId>>,
 }
 
 impl ViewState {
     pub fn new() -> Self {
         Self {
             tile_needed: Cell::new(None),
+            first_visible_tile: Cell::new(None),
         }
     }
 }
@@ -463,16 +465,16 @@ async fn on_touch(mut xpt: touch::TOUCH, touch_state: &'static TouchState) {
     }
 }
 
-static mut TILES_1: [tile_cache::TileData; 5] = tile_cache::empty();
+static mut TILES_1: [tile_cache::TileData; 1] = tile_cache::empty();
 #[link_section = ".dram2_uninit"]
-static mut TILES_2: [tile_cache::TileData; 5] = tile_cache::empty();
+static mut TILES_2: [tile_cache::TileData; 1] = tile_cache::empty();
 
 type TILE_CACHE = TileCache<'static>;
 
 #[cfg(feature = "psram")]
 const NUM_PSRAM_TILES: usize =
     //    hal::psram::PSRAM_BYTES / core::mem::size_of::<tile_cache::TileData>()
-    60;
+    100;
 #[cfg(not(feature = "psram"))]
 const NUM_PSRAM_TILES: usize = 0;
 
@@ -548,12 +550,19 @@ async fn render_task(
         let first_tile_x = global_x / TILE_WIDTH;
         let first_tile_y = global_y / TILE_WIDTH;
 
+        view_state.first_visible_tile.replace(Some(TileId {
+            zoom_level,
+            x: first_tile_x as u32,
+            y: first_tile_y as u32,
+        }));
+
         let mut total = 0;
+        let mut num_missing = 0;
 
         let mut tile_needed = None;
 
-        for tile_x in first_tile_x..first_tile_x + DISPLAY_WIDTH / TILE_WIDTH + 2 {
-            for tile_y in first_tile_y..first_tile_y + DISPLAY_HEIGHT / TILE_WIDTH + 2 {
+        for tile_x in first_tile_x..first_tile_x + DISPLAY_WIDTH_IN_TILES {
+            for tile_y in first_tile_y..first_tile_y + DISPLAY_HEIGHT_IN_TILES {
                 let tile_id = TileId {
                     zoom_level,
                     x: tile_x as u32,
@@ -575,8 +584,11 @@ async fn render_task(
                         .draw_tile(&rtc, target_x, target_y, Some(*data))
                         .await;
                 } else {
+                    num_missing += 1;
                     display.draw_tile(&rtc, target_x, target_y, None).await;
-                    tile_needed = Some(tile_id);
+                    if tile_needed.is_none() {
+                        tile_needed = Some(tile_id);
+                    }
                 }
             }
         }
@@ -584,7 +596,11 @@ async fn render_task(
         view_state.tile_needed.replace(tile_needed);
 
         let end = rtc.get_time_us();
-        print!("rendered in {}us\r", end - start);
+        print!(
+            "rendered in {}us, {} missing tiles\r",
+            end - start,
+            num_missing
+        );
 
         //        input.wait_for_rising_edge().await;
     }
@@ -592,6 +608,9 @@ async fn render_task(
 
 const DISPLAY_WIDTH: usize = 320;
 const DISPLAY_HEIGHT: usize = 240;
+
+const DISPLAY_WIDTH_IN_TILES: usize = DISPLAY_WIDTH / TILE_WIDTH + 2;
+const DISPLAY_HEIGHT_IN_TILES: usize = DISPLAY_HEIGHT / TILE_WIDTH + 2;
 
 struct Display2<SPI, DC> {
     spi: SPI,
@@ -742,15 +761,20 @@ struct TileDecoder<'a> {
     cache: &'a TileCache<'a>,
     tile_id: BigTileId,
     png: PngReader,
-    current_row_tiles: [Option<TileDataGuard<'a>>; 4],
+    current_row_tiles: [Option<TileDataGuard<'a, 'a>>; 4],
     x: usize,
     y: usize,
+    first_visible_tile: Option<TileId>,
 }
 
 const BIG_TILE_WIDTH: usize = 256;
 
 impl<'a> TileDecoder<'a> {
-    fn new(cache: &'a TileCache<'a>, tile_id: BigTileId) -> Self {
+    fn new(
+        cache: &'a TileCache<'a>,
+        tile_id: BigTileId,
+        first_visible_tile: Option<TileId>,
+    ) -> Self {
         Self {
             cache,
             tile_id,
@@ -758,6 +782,7 @@ impl<'a> TileDecoder<'a> {
             current_row_tiles: Default::default(),
             x: 0,
             y: 0,
+            first_visible_tile,
         }
     }
 
@@ -768,28 +793,27 @@ impl<'a> TileDecoder<'a> {
 
     fn update_tiles(
         cache: &'a TileCache<'a>,
-        current_row_tiles: &mut [Option<TileDataGuard<'a>>; 4],
+        current_row_tiles: &mut [Option<TileDataGuard<'a, 'a>>; 4],
         tile_id: BigTileId,
         y: usize,
+        first_visible_tile: Option<TileId>,
     ) {
         for (i, g) in current_row_tiles.iter_mut().enumerate() {
-            match cache.find_empty() {
+            match cache.find_place(|tile_id| !is_on_screen(first_visible_tile, tile_id)) {
                 None => {
                     // No space in cache, skip the tile
                     // TODO: evict something
                     *g = None;
                     println!("No space in cache");
                 }
-                Some(td) => {
+                Some((td, data)) => {
                     let tile_id = TileId {
                         zoom_level: tile_id.zoom_level,
                         x: tile_id.x * 4 + i as u32,
                         y: tile_id.y * 4 + y as u32 / tile_cache::TILE_WIDTH as u32,
                     };
                     println!("Saving {:?} in cache", tile_id);
-                    *g = Some(td.try_lock_data().expect(
-                        "Tile descriptor was supposed to be empty, data shouldn't be locked",
-                    ));
+                    *g = Some(data);
                     td.set_id(tile_id);
                 }
             }
@@ -806,6 +830,7 @@ impl<'a> TileDecoder<'a> {
                         &mut self.current_row_tiles,
                         self.tile_id,
                         self.y,
+                        self.first_visible_tile,
                     );
                 }
                 inflater::Event::ImageData(pixels) => {
@@ -837,6 +862,7 @@ impl<'a> TileDecoder<'a> {
                                     &mut self.current_row_tiles,
                                     self.tile_id,
                                     self.y,
+                                    self.first_visible_tile,
                                 );
                             }
                         }
@@ -847,6 +873,21 @@ impl<'a> TileDecoder<'a> {
             ControlFlow::Continue(())
         });
     }
+}
+
+fn is_on_screen(first_visible_tile: Option<TileId>, tile_id: TileId) -> bool {
+    if let Some(first) = first_visible_tile {
+        if first.zoom_level == tile_id.zoom_level
+            && tile_id.x >= first.x
+            && tile_id.x < first.x + DISPLAY_WIDTH_IN_TILES as u32
+            && tile_id.y >= first.y
+            && tile_id.y < first.y + DISPLAY_HEIGHT_IN_TILES as u32
+        {
+            //            println!("tile {} {} is on screen, sorry", tile_id.x, tile_id.y);
+            return true;
+        }
+    }
+    false
 }
 
 // TODO: something like this should be in `incremental-png` itself
@@ -991,12 +1032,12 @@ mod tile_cache {
             *self.id.lock() = Some(id);
         }
 
-        pub fn try_lock_data(&'d self) -> Option<TileDataGuard<'d>> {
+        pub fn try_lock_data<'t>(&'t self) -> Option<TileDataGuard<'t, 'd>> {
             self.data.try_lock()
         }
     }
 
-    pub type TileDataGuard<'d> = SpinMutexGuard<'d, &'d mut TileData>;
+    pub type TileDataGuard<'t, 'd> = SpinMutexGuard<'t, &'d mut TileData>;
 
     pub struct TileCache<'d> {
         descriptors: &'d [TileDescriptor<'d>],
@@ -1015,13 +1056,30 @@ mod tile_cache {
         }
 
         /// Returns any empty tile descriptor.
-        ///
-        /// (In the future we'll return not only empty ones, it will be an eviction policy)
         pub fn find_empty(&self) -> Option<&TileDescriptor<'d>> {
             self.descriptors
                 .as_ref()
                 .iter()
                 .find(|&d| d.get_id().is_none())
+        }
+
+        pub fn find_place<'t>(
+            &'t self,
+            filter: impl Fn(TileId) -> bool,
+        ) -> Option<(&'t TileDescriptor<'d>, TileDataGuard<'t, 'd>)> {
+            if let Some(d) = self.find_empty() {
+                if let Some(data) = d.try_lock_data() {
+                    return Some((d, data));
+                }
+            }
+            self.descriptors.as_ref().iter().find_map(|d| {
+                if d.get_id().map(|x| filter(x)).unwrap_or(true) {
+                    if let Some(data) = d.try_lock_data() {
+                        return Some((d, data));
+                    }
+                }
+                None
+            })
         }
     }
 }
@@ -1041,7 +1099,7 @@ async fn loader_task(
     let mut ticker = Ticker::every(Duration::from_millis(100));
     loop {
         ticker.next().await;
-        let Some(tile_id) = view_state.tile_needed.get() else {
+        let Some(tile_id) = view_state.tile_needed.replace(None) else {
             continue;
         };
 
@@ -1071,11 +1129,13 @@ async fn loader_task(
             big_tile_id.zoom_level, big_tile_id.x, big_tile_id.y
         );
 
+        println!("url is: {}", url);
+
         let mut http_client = HttpClient::new(&tcp_client, &dns);
-        let mut request = http_client.request(Method::GET, "").await.unwrap();
+        let mut request = http_client.request(Method::GET, &url).await.unwrap();
 
         let response = request.send(&mut rx_buffer).await.unwrap();
-        let mut td = TileDecoder::new(tile_cache, big_tile_id);
+        let mut td = TileDecoder::new(tile_cache, big_tile_id, view_state.first_visible_tile.get());
         let mut reader = response.body().reader();
 
         let mut buf = [0; 2048];
@@ -1086,7 +1146,7 @@ async fn loader_task(
                 break;
             }
             total_bytes_read += n;
-            println!("Received {} bytes (total {})", n, total_bytes_read);
+            //            println!("Received {} bytes (total {})", n, total_bytes_read);
 
             td.process_data(&buf[..n]);
         }
