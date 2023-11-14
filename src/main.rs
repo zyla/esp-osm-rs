@@ -19,6 +19,7 @@ use crate::tile_cache::TileDescriptor;
 use crate::tile_cache::TileId;
 use crate::tile_cache::TILE_SIZE_BYTES;
 use core::cell::Cell;
+use core::fmt::Write;
 use core::future::Future;
 use core::{alloc::GlobalAlloc, ops::ControlFlow, str};
 use embassy_net::{
@@ -1032,12 +1033,18 @@ async fn loader_task(
     tile_cache: &'static TILE_CACHE,
     view_state: &'static ViewState,
 ) {
+    let mut rx_buffer = [0; 2048];
+    let client_state = TcpClientState::<1, 2048, 2048>::new();
+    let tcp_client = TcpClient::new(stack, &client_state);
+    let dns = DnsSocket::new(stack);
+
     let mut ticker = Ticker::every(Duration::from_millis(100));
     loop {
         ticker.next().await;
         let Some(tile_id) = view_state.tile_needed.get() else {
             continue;
         };
+
         let big_tile_id = BigTileId {
             zoom_level: tile_id.zoom_level,
             x: tile_id.x / 4,
@@ -1046,16 +1053,44 @@ async fn loader_task(
 
         println!("\nLoading tile ({}, {})", big_tile_id.x, big_tile_id.y);
 
+        stack.wait_config_up().await;
+        loop {
+            if let Some(config) = stack.config_v4() {
+                println!("Got IP: {}", config.address);
+                break;
+            }
+            Timer::after(Duration::from_millis(500)).await;
+        }
+
         let start = rtc.get_time_us();
 
-        let png_bytes = include_bytes!("../test-tile.png");
-        println!("num bytes: {}", png_bytes.len());
+        let mut url = heapless::String::<128>::new();
+        write!(
+            url,
+            "http://192.168.43.129:8081/tile/{}/{}/{}.png",
+            big_tile_id.zoom_level, big_tile_id.x, big_tile_id.y
+        );
 
-        {
-            let mut td = TileDecoder::new(tile_cache, big_tile_id);
-            td.process_data(png_bytes);
-            td.finish();
+        let mut http_client = HttpClient::new(&tcp_client, &dns);
+        let mut request = http_client.request(Method::GET, "").await.unwrap();
+
+        let response = request.send(&mut rx_buffer).await.unwrap();
+        let mut td = TileDecoder::new(tile_cache, big_tile_id);
+        let mut reader = response.body().reader();
+
+        let mut buf = [0; 2048];
+        let mut total_bytes_read = 0;
+        loop {
+            let n = reader.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total_bytes_read += n;
+            println!("Received {} bytes (total {})", n, total_bytes_read);
+
+            td.process_data(&buf[..n]);
         }
+        td.finish();
 
         let end = rtc.get_time_us();
         println!("incremental-png decoded in {}us", end - start);
