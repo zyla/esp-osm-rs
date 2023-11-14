@@ -212,7 +212,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     let clocks = ClockControl::max(system.clock_control).freeze();
 
     #[cfg(any(feature = "esp32c3", feature = "esp32"))]
-    let mut rtc = Rtc::new(peripherals.RTC_CNTL);
+    let rtc = make_static!(Rtc::new(peripherals.RTC_CNTL));
     #[cfg(feature = "esp32c6")]
     let mut rtc = Rtc::new(peripherals.LP_CLKRST);
 
@@ -368,6 +368,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     xpt_drv.init(&mut delay).unwrap();
 
     let touch_state = make_static!(TouchState::new());
+    let view_state = make_static!(ViewState::new());
 
     spawner.spawn(on_touch(xpt_drv, touch_state)).ok();
 
@@ -378,10 +379,10 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     let tile_cache = make_static!(init_tile_cache());
 
-    //   spawner.spawn(connection_wifi(controller)).ok();
-    //   spawner.spawn(net_task(stack)).ok();
+    spawner.spawn(connection_wifi(controller)).ok();
+    spawner.spawn(net_task(stack)).ok();
     spawner
-        .spawn(task(
+        .spawn(render_task(
             input,
             stack,
             seed.into(),
@@ -391,8 +392,24 @@ async fn main(spawner: embassy_executor::Spawner) {
             dma.spi2channel,
             tile_cache,
             touch_state,
+            view_state,
         ))
         .ok();
+    spawner
+        .spawn(loader_task(stack, rtc, tile_cache, view_state))
+        .ok();
+}
+
+struct ViewState {
+    tile_needed: Cell<Option<TileId>>,
+}
+
+impl ViewState {
+    pub fn new() -> Self {
+        Self {
+            tile_needed: Cell::new(None),
+        }
+    }
 }
 
 struct TouchState {
@@ -482,50 +499,18 @@ fn init_tile_cache() -> TILE_CACHE {
 }
 
 #[embassy_executor::task]
-async fn task(
+async fn render_task(
     mut input: BUTTON,
     stack: &'static Stack<WifiDevice<'static>>,
     _seed: u64,
     display: DISPLAY<'static>,
     mut delay: Delay,
-    rtc: Rtc<'static>,
+    rtc: &'static Rtc<'static>,
     dma_channel: Spi2DmaChannelCreator,
     tile_cache: &'static TILE_CACHE,
     touch_state: &'static TouchState,
+    view_state: &'static ViewState,
 ) {
-    let start = rtc.get_time_us();
-
-    let png_bytes = include_bytes!("../test-tile.png");
-    println!("num bytes: {}", png_bytes.len());
-
-    {
-        let mut td = TileDecoder::new(
-            tile_cache,
-            BigTileId {
-                zoom_level: 18,
-                x: 146372,
-                y: 86317,
-            },
-        );
-        td.process_data(png_bytes);
-        td.finish();
-    }
-    {
-        let mut td = TileDecoder::new(
-            tile_cache,
-            BigTileId {
-                zoom_level: 18,
-                x: 146373,
-                y: 86317,
-            },
-        );
-        td.process_data(include_bytes!("../test-tile.png"));
-        td.finish();
-    }
-
-    let end = rtc.get_time_us();
-    println!("incremental-png decoded in {}us", end - start);
-
     let (di, _, _) = display.release();
     let (spi, dc) = di.release();
 
@@ -564,6 +549,8 @@ async fn task(
 
         let mut total = 0;
 
+        let mut tile_needed = None;
+
         for tile_x in first_tile_x..first_tile_x + DISPLAY_WIDTH / TILE_WIDTH + 2 {
             for tile_y in first_tile_y..first_tile_y + DISPLAY_HEIGHT / TILE_WIDTH + 2 {
                 let tile_id = TileId {
@@ -588,9 +575,12 @@ async fn task(
                         .await;
                 } else {
                     display.draw_tile(&rtc, target_x, target_y, None).await;
+                    tile_needed = Some(tile_id);
                 }
             }
         }
+
+        view_state.tile_needed.replace(tile_needed);
 
         let end = rtc.get_time_us();
         print!("rendered in {}us\r", end - start);
@@ -1032,5 +1022,42 @@ mod tile_cache {
                 .iter()
                 .find(|&d| d.get_id().is_none())
         }
+    }
+}
+
+#[embassy_executor::task]
+async fn loader_task(
+    stack: &'static Stack<WifiDevice<'static>>,
+    rtc: &'static Rtc<'static>,
+    tile_cache: &'static TILE_CACHE,
+    view_state: &'static ViewState,
+) {
+    let mut ticker = Ticker::every(Duration::from_millis(100));
+    loop {
+        ticker.next().await;
+        let Some(tile_id) = view_state.tile_needed.get() else {
+            continue;
+        };
+        let big_tile_id = BigTileId {
+            zoom_level: tile_id.zoom_level,
+            x: tile_id.x / 4,
+            y: tile_id.y / 4,
+        };
+
+        println!("\nLoading tile ({}, {})", big_tile_id.x, big_tile_id.y);
+
+        let start = rtc.get_time_us();
+
+        let png_bytes = include_bytes!("../test-tile.png");
+        println!("num bytes: {}", png_bytes.len());
+
+        {
+            let mut td = TileDecoder::new(tile_cache, big_tile_id);
+            td.process_data(png_bytes);
+            td.finish();
+        }
+
+        let end = rtc.get_time_us();
+        println!("incremental-png decoded in {}us", end - start);
     }
 }
