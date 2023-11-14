@@ -6,6 +6,7 @@
 #![feature(const_mut_refs)]
 #![feature(generic_arg_infer)]
 #![feature(cell_update)]
+#![feature(const_trait_impl)]
 #![allow(clippy::upper_case_acronyms)]
 #![allow(non_camel_case_types)]
 #![allow(unused)]
@@ -13,8 +14,10 @@ extern crate alloc;
 use crate::hal::dma::DmaPriority;
 use crate::hal::pdma::Dma;
 use crate::hal::pdma::Spi2DmaChannelCreator;
+use crate::tile_cache::TileData;
 use crate::tile_cache::TileDescriptor;
 use crate::tile_cache::TileId;
+use crate::tile_cache::TILE_SIZE_BYTES;
 use core::cell::Cell;
 use core::future::Future;
 use core::{alloc::GlobalAlloc, ops::ControlFlow, str};
@@ -370,6 +373,9 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     let delay = Delay::new(&clocks);
 
+    #[cfg(feature = "psram")]
+    hal::psram::init_psram(peripherals.PSRAM);
+
     let tile_cache = make_static!(init_tile_cache());
 
     //   spawner.spawn(connection_wifi(controller)).ok();
@@ -439,20 +445,39 @@ async fn on_touch(mut xpt: touch::TOUCH, touch_state: &'static TouchState) {
     }
 }
 
-static mut TILES_1: [tile_cache::TileData; 8] = tile_cache::empty();
+static mut TILES_1: [tile_cache::TileData; 5] = tile_cache::empty();
 #[link_section = ".dram2_uninit"]
-static mut TILES_2: [tile_cache::TileData; 11] = tile_cache::empty();
+static mut TILES_2: [tile_cache::TileData; 5] = tile_cache::empty();
 
 type TILE_CACHE = TileCache<'static>;
 
+#[cfg(feature = "psram")]
+const NUM_PSRAM_TILES: usize =
+    //    hal::psram::PSRAM_BYTES / core::mem::size_of::<tile_cache::TileData>()
+    60;
+#[cfg(not(feature = "psram"))]
+const NUM_PSRAM_TILES: usize = 0;
+
 fn init_tile_cache() -> TILE_CACHE {
-    let descriptors: &mut heapless::Vec<tile_cache::TileDescriptor<'static>, { 9 + 11 }> =
-        make_static!(heapless::Vec::from_iter(
-            unsafe { &mut TILES_1 }
-                .iter_mut()
-                .chain(unsafe { &mut TILES_2 }.iter_mut())
-                .map(TileDescriptor::new)
-        ));
+    #[cfg(feature = "psram")]
+    let psram_tiles = (0..NUM_PSRAM_TILES).map(|i| unsafe {
+        &mut *((hal::psram::PSRAM_VADDR_START + i * core::mem::size_of::<TileData>())
+            as *mut TileData)
+    });
+
+    #[cfg(not(feature = "psram"))]
+    let psram_tiles = core::iter::empty();
+
+    let descriptors: &mut heapless::Vec<
+        tile_cache::TileDescriptor<'static>,
+        { 5 + 5 + NUM_PSRAM_TILES },
+    > = make_static!(heapless::Vec::from_iter(
+        psram_tiles
+            .chain(unsafe { &mut TILES_1 }.iter_mut())
+            .chain(unsafe { &mut TILES_2 }.iter_mut())
+            .map(TileDescriptor::new)
+    ));
+
     TileCache::new(descriptors.as_slice())
 }
 
@@ -468,21 +493,35 @@ async fn task(
     tile_cache: &'static TILE_CACHE,
     touch_state: &'static TouchState,
 ) {
-    let png_bytes = include_bytes!("../test-tile.png");
-
-    println!("num png bytes: {}", png_bytes.len());
     let start = rtc.get_time_us();
 
-    let mut td = TileDecoder::new(
-        tile_cache,
-        BigTileId {
-            zoom_level: 18,
-            x: 146372,
-            y: 86317,
-        },
-    );
-    td.process_data(png_bytes);
-    td.finish();
+    let png_bytes = include_bytes!("../test-tile.png");
+    println!("num bytes: {}", png_bytes.len());
+
+    {
+        let mut td = TileDecoder::new(
+            tile_cache,
+            BigTileId {
+                zoom_level: 18,
+                x: 146372,
+                y: 86317,
+            },
+        );
+        td.process_data(png_bytes);
+        td.finish();
+    }
+    {
+        let mut td = TileDecoder::new(
+            tile_cache,
+            BigTileId {
+                zoom_level: 18,
+                x: 146373,
+                y: 86317,
+            },
+        );
+        td.process_data(include_bytes!("../test-tile.png"));
+        td.finish();
+    }
 
     let end = rtc.get_time_us();
     println!("incremental-png decoded in {}us", end - start);
@@ -500,7 +539,9 @@ async fn task(
         DmaPriority::Priority0,
     )));
 
-    let mut display = Display2::new(spi, dc);
+    let local_tile_buffer: &'static mut TileData = make_static!([0; TILE_SIZE_BYTES]);
+
+    let mut display = Display2::new(spi, dc, local_tile_buffer);
 
     let mut zoom_level = 0;
     let mut global_x: usize = 0;
@@ -558,13 +599,13 @@ async fn task(
     }
 }
 
-// A bit smaller until we have PSRAM
-const DISPLAY_WIDTH: usize = 240;
+const DISPLAY_WIDTH: usize = 320;
 const DISPLAY_HEIGHT: usize = 240;
 
 struct Display2<SPI, DC> {
     spi: SPI,
     dc: DC,
+    local_tile_buffer: &'static mut TileData,
 }
 use crate::hal::prelude::_embedded_hal_async_spi_SpiBus as SpiBus;
 use crate::hal::prelude::_embedded_hal_blocking_spi_Write as SpiWrite;
@@ -574,8 +615,12 @@ where
     <SPI as SpiWrite<u8>>::Error: core::fmt::Debug,
     <DC as _embedded_hal_digital_v2_OutputPin>::Error: core::fmt::Debug,
 {
-    pub fn new(spi: SPI, dc: DC) -> Self {
-        Self { spi, dc }
+    pub fn new(spi: SPI, dc: DC, local_tile_buffer: &'static mut TileData) -> Self {
+        Self {
+            spi,
+            dc,
+            local_tile_buffer,
+        }
     }
 
     pub async fn draw_tile(
@@ -645,31 +690,31 @@ where
         //       println!("Set_Page_Address({display_row_start}, {display_row_end})");
         //       println!("Tile rect: ({tile_offset_x}, {tile_offset_y}, {width}, {height})");
         if let Some(data) = data {
+            let num_bytes = width as usize * height as usize * BYTES_PER_PIXEL;
             if !clipped_x {
                 // Easy case: one transfer
-                SpiBus::write(
-                    &mut self.spi,
+                self.local_tile_buffer[..num_bytes].copy_from_slice(
                     &data[tile_offset_y as usize * TILE_WIDTH * BYTES_PER_PIXEL
                         ..(tile_offset_y + height) as usize * TILE_WIDTH * BYTES_PER_PIXEL],
                 )
-                .await
-                .unwrap();
             } else {
                 // Transfer each row separately
 
+                let mut offset = 0;
                 for y in tile_offset_y..tile_offset_y + height {
                     let off = y as usize * TILE_WIDTH * BYTES_PER_PIXEL
                         + tile_offset_x as usize * BYTES_PER_PIXEL;
                     let n = width as usize * BYTES_PER_PIXEL;
-                    if n >= MIN_ASYNC_TRANSFER_SIZE {
-                        SpiBus::write(&mut self.spi, &data[off..off + n])
-                            .await
-                            .unwrap();
-                    } else {
-                        //                        println!("transfer {n}");
-                        SpiWrite::write(&mut self.spi, &data[off..off + n]).unwrap();
-                    }
+                    self.local_tile_buffer[offset..offset + n].copy_from_slice(&data[off..off + n]);
+                    offset += n;
                 }
+            }
+            if num_bytes >= MIN_ASYNC_TRANSFER_SIZE {
+                SpiBus::write(&mut self.spi, &self.local_tile_buffer[..num_bytes])
+                    .await
+                    .unwrap();
+            } else {
+                SpiWrite::write(&mut self.spi, &self.local_tile_buffer[..num_bytes]).unwrap();
             }
         } else {
             // Drawing an empty tile
@@ -742,6 +787,7 @@ impl<'a> TileDecoder<'a> {
                     // No space in cache, skip the tile
                     // TODO: evict something
                     *g = None;
+                    println!("No space in cache");
                 }
                 Some(td) => {
                     let tile_id = TileId {

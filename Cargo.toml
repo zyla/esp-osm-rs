@@ -64,6 +64,8 @@ esp32c3 = ["esp32c3-hal", "esp-backtrace/esp32c3", "esp-println/esp32c3", "esp-w
 esp32c6 = ["esp32c6-hal", "esp-backtrace/esp32c6", "esp-println/esp32c6", "esp-wifi/esp32c6", "embassy-executor/arch-riscv32"]
 esp32 = ["esp32-hal", "esp-backtrace/esp32", "esp-println/esp32", "esp-wifi/esp32", "embassy-executor/arch-xtensa"]
 
+psram = ["esp32-hal/psram_8m"]
+
 [profile.dev.package.esp-wifi]
 opt-level = 3
 
