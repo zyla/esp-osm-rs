@@ -1125,7 +1125,8 @@ async fn loader_task(
         let mut url = heapless::String::<128>::new();
         write!(
             url,
-            "http://192.168.43.129:8081/tile/{}/{}/{}.png",
+            "{}/{}/{}/{}.png",
+            env!("TILESERVER"),
             big_tile_id.zoom_level, big_tile_id.x, big_tile_id.y
         );
 
