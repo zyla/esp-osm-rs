@@ -35,6 +35,7 @@ runner = "espflash flash --monitor"
 
 [env]
 ESP_LOGLEVEL="INFO"
+SMOLTCP_DNS_MAX_SERVER_COUNT="2"
 
 [build]
 rustflags = [

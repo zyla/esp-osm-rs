@@ -6,12 +6,13 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [patch.crates-io]
-embassy-executor = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
-embassy-net = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
-embassy-net-driver = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46"}
-embassy-time = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
-embassy-macros = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
-embassy-sync = { git = "https://github.com/zyla/embassy", rev = "4e27208fca46" }
+embassy-executor = { git = "https://github.com/zyla/embassy", rev = "d42a3279" }
+embassy-net = { git = "https://github.com/zyla/embassy", rev = "d42a3279" }
+embassy-net-driver = { git = "https://github.com/zyla/embassy", rev = "d42a3279"}
+embassy-time = { git = "https://github.com/zyla/embassy", rev = "d42a3279" }
+embassy-macros = { git = "https://github.com/zyla/embassy", rev = "d42a3279" }
+embassy-sync = { git = "https://github.com/zyla/embassy", rev = "d42a3279" }
+smoltcp = { git = "https://github.com/jborkowski/smoltcp.git", rev = "db7a929" }
 
 esp-hal-common = { path = "./libs/esp-hal/esp-hal-common" }
 esp32-hal = { path = "./libs/esp-hal/esp32-hal" }
@@ -58,7 +59,7 @@ embedded-hal-1 = { version = "=1.0.0-rc.1", package = "embedded-hal" }
 spin = "0.9.8"
 
 [features]
-default = ["esp32"]
+default = ["esp32", "psram"]
 
 esp32c3 = ["esp32c3-hal", "esp-backtrace/esp32c3", "esp-println/esp32c3", "esp-wifi/esp32c3", "embassy-executor/arch-riscv32"]
 esp32c6 = ["esp32c6-hal", "esp-backtrace/esp32c6", "esp-println/esp32c6", "esp-wifi/esp32c6", "embassy-executor/arch-riscv32"]
